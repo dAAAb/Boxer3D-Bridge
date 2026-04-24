@@ -8,6 +8,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
 import { DragStateManager } from './DragStateManager';
 import { GeomBuilder } from './rendering/GeomBuilder';
+import { MeshLibrary } from './rendering/MeshLibrary';
 import { MujocoData, MujocoModel, MujocoModule } from './types';
 
 /**
@@ -20,8 +21,9 @@ export class RenderSystem {
     camera: THREE.PerspectiveCamera;
     controls: OrbitControls; 
     
-    simGroup: THREE.Group;   
-    bodies: Array<THREE.Group> = []; 
+    simGroup: THREE.Group;
+    bodies: Array<THREE.Group> = [];
+    meshLibrary = new MeshLibrary();
     
     ambientLight!: THREE.AmbientLight;
     customLights: { light: THREE.PointLight; helper: THREE.Mesh; control: TransformControls; name: string; baseIntensity: number; }[] = [];
@@ -90,6 +92,16 @@ export class RenderSystem {
         this.grid.rotation.x = Math.PI / 2;
         this.grid.position.z = -0.001;
         this.scene.add(this.grid);
+
+        // RGB axes at Franka base: red = +X (forward), green = +Y (left),
+        // blue = +Z (up). Added once; reused across scene reloads.
+        if (!this.scene.getObjectByName('_axesHelper')) {
+            const axes = new THREE.AxesHelper(0.35);
+            axes.name = '_axesHelper';
+            (axes.material as THREE.LineBasicMaterial).depthTest = false;
+            axes.renderOrder = 998;
+            this.scene.add(axes);
+        }
     }
 
     setDarkMode(enabled: boolean) {
@@ -271,6 +283,50 @@ export class RenderSystem {
             return { point: hits[0].point, bodyId };
         }
         return null;
+    }
+
+    /// Attach canonical white USDZ meshes to stream-injected bodies.
+    /// Hides the MuJoCo box geom when a mesh is available so the overlay
+    /// reads cleanly. Bodies without a registered mesh keep their white
+    /// collision box visible as a fallback. Also drops a floating "label #idx"
+    /// sprite above each body so you can eyeball the spatial mapping.
+    async attachStreamMeshes(entries: { bodyId: number; label: string; trackId: string }[]) {
+        await Promise.all(entries.map(async ({ bodyId, label, trackId }) => {
+            const clone = await this.meshLibrary.get(label);
+            const group = this.bodies[bodyId];
+            if (!group) return;
+            if (clone) {
+                for (const child of group.children) {
+                    if ((child as THREE.Mesh).isMesh) child.visible = false;
+                }
+                group.add(clone);
+            }
+            const short = trackId.replace(/_/g, '').slice(0, 4).toUpperCase();
+            group.add(this.makeLabelSprite(`${label} #${short}`));
+        }));
+    }
+
+    private makeLabelSprite(text: string): THREE.Sprite {
+        const canvas = document.createElement('canvas');
+        const w = 256, h = 72;
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext('2d')!;
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.82)';
+        ctx.roundRect?.(0, 0, w, h, 16) ?? ctx.fillRect(0, 0, w, h);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 40px -apple-system, system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(text, w / 2, h / 2);
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.anisotropy = 4;
+        const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false });
+        const sprite = new THREE.Sprite(mat);
+        sprite.scale.set(0.10, 0.028, 1);
+        sprite.position.set(0, 0, 0.12);
+        sprite.renderOrder = 999;
+        return sprite;
     }
 
     clearErMarkers() { this.erGroup.clear(); }

@@ -9,7 +9,7 @@ import { DragStateManager } from './DragStateManager';
 import { IkSystem } from './IkSystem';
 import { RenderSystem } from './RenderSystem';
 import { RobotLoader } from './RobotLoader';
-import { SceneReport } from './SceneReport';
+import { SceneReport, STREAM_BODY_REGEX, computeStreamPoses, streamBodyName } from './SceneReport';
 import { SelectionManager } from './SelectionManager';
 import { SequenceAnimator } from './SequenceAnimator';
 import { MujocoData, MujocoModel, MujocoModule } from './types';
@@ -38,6 +38,16 @@ export class MujocoSim {
 
     private currentRobotId = 'franka_emika_panda';
     private currentSceneFile = 'scene.xml';
+
+    /// Name → bodyId lookup populated after reloadWithScene. Used by
+    /// applyStreamUpdate to teleport bodies 10 Hz without walking the
+    /// entire body list each tick.
+    private streamBodyMap = new Map<string, number>();
+    /// Latest stream report. Re-applied on EVERY sim step (not just on
+    /// stream tick) so gravity and contact impulses can't push bodies
+    /// between updates — this is what kills the otherwise visible 10 Hz
+    /// flicker when the stream is slower than the physics step.
+    private latestStreamReport: SceneReport | null = null;
     
     private userIkEnabled = false; 
     private firstIkEnable = true; // Track first enable to enforce default rotation
@@ -225,6 +235,10 @@ export class MujocoSim {
                 const startSimTime = this.mjData.time;
                 // Allow simulation to run faster than real-time based on speedMultiplier
                 while (this.mjData.time - startSimTime < (1.0 / 60.0) * this.speedMultiplier) {
+                    // Re-impose stream target just before each physics step
+                    // so integrated gravity / contact forces don't drift the
+                    // body between 10 Hz stream updates.
+                    this.applyLatestStreamPoses();
                     this.mujoco.mj_step(this.mjModel, this.mjData);
                 }
             }
@@ -354,7 +368,81 @@ export class MujocoSim {
         this.firstIkEnable = true;
 
         this.sequenceAnimator.init(this.mjModel, isStacking, (addr) => getName(this.mjModel!, addr));
+
+        // Attach USDZ mesh overlays for stream-injected bodies, and cache
+        // the name → bodyId lookup so the live-update path doesn't need to
+        // scan all bodies every 10 Hz tick.
+        this.streamBodyMap.clear();
+        this.latestStreamReport = null;
+        const streamEntries: { bodyId: number; label: string; trackId: string }[] = [];
+        for (let i = 0; i < this.mjModel.nbody; i++) {
+            const name = getName(this.mjModel, this.mjModel.name_bodyadr[i]);
+            const match = name.match(STREAM_BODY_REGEX);
+            if (match) {
+                streamEntries.push({ bodyId: i, label: match[1], trackId: match[2] });
+                this.streamBodyMap.set(name, i);
+            }
+        }
+        if (streamEntries.length > 0) {
+            this.renderSys.attachStreamMeshes(streamEntries);
+        }
+
         this.startLoop();
+    }
+
+    /// Stash the latest stream snapshot. Actual qpos writes happen in the
+    /// main sim loop (see `applyLatestStreamPoses`) so the teleport runs
+    /// at physics rate, not just at 10 Hz — otherwise bodies visibly drift
+    /// under gravity between stream ticks and then snap back.
+    applyStreamUpdate(scene: SceneReport) {
+        this.latestStreamReport = scene;
+    }
+
+    private applyLatestStreamPoses() {
+        const scene = this.latestStreamReport;
+        if (!scene || !this.mjModel || !this.mjData) return;
+        if (this.streamBodyMap.size === 0) return;
+        // Pause during pickup sequences so the gripper can actually carry
+        // a body without being yanked back to its streamed pose every step.
+        if (this.sequenceAnimator.running) return;
+
+        const poses = computeStreamPoses(scene);
+        for (let i = 0; i < scene.objects.length; i++) {
+            const o = scene.objects[i];
+            const name = streamBodyName(o.label, o.id);
+            const bodyId = this.streamBodyMap.get(name);
+            if (bodyId === undefined) continue;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const jntAdr = (this.mjModel as any).body_jntadr[bodyId];
+            if (jntAdr < 0) continue;
+            const qp = this.mjModel.jnt_qposadr[jntAdr];
+            const p = poses[i];
+            this.mjData.qpos[qp + 0] = p.x;
+            this.mjData.qpos[qp + 1] = p.y;
+            this.mjData.qpos[qp + 2] = p.z;
+            const half = p.yaw / 2;
+            this.mjData.qpos[qp + 3] = Math.cos(half);
+            this.mjData.qpos[qp + 4] = 0;
+            this.mjData.qpos[qp + 5] = 0;
+            this.mjData.qpos[qp + 6] = Math.sin(half);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const dofAdr = (this.mjModel as any).jnt_dofadr?.[jntAdr];
+            if (dofAdr !== undefined) {
+                for (let k = 0; k < 6; k++) this.mjData.qvel[dofAdr + k] = 0;
+            }
+        }
+    }
+
+    /// Look up the current world position of a stream-injected body by its
+    /// label + track UUID. Returns null if the track isn't in the current
+    /// scene — caller should fall back to Gemini or prompt a reload. Used
+    /// by the "direct pickup" UI path that bypasses Gemini for objects
+    /// whose identity we already know from the Boxer3D stream.
+    getStreamBodyPosition(label: string, trackId: string): THREE.Vector3 | null {
+        const name = streamBodyName(label, trackId);
+        const bodyId = this.streamBodyMap.get(name);
+        if (bodyId === undefined) return null;
+        return this.renderSys.bodies[bodyId]?.position.clone() ?? null;
     }
 
     reset() {

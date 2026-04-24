@@ -50,10 +50,10 @@ interface LogOverlayProps {
  */
 export function LogOverlay({ log }: LogOverlayProps) {
   if (!log.result || !Array.isArray(log.result)) return null;
-  
+
   const results = log.result as DetectedItem[];
   const shapes = results.map((item, idx) => {
-    if (item.box_2d) {
+    if (Array.isArray(item?.box_2d) && item.box_2d.length === 4) {
       const [ymin, xmin, ymax, xmax] = item.box_2d;
       return (
         <rect 
@@ -62,7 +62,7 @@ export function LogOverlay({ log }: LogOverlayProps) {
           vectorEffect="non-scaling-stroke"
         />
       );
-    } else if (item.point) {
+    } else if (Array.isArray(item?.point) && item.point.length === 2) {
       const [y, x] = item.point;
       // Using vector-effect="non-scaling-stroke" ensures the circle border is visible even in small miniatures.
       // cx/cy are normalized 0-1000.
@@ -116,6 +116,8 @@ export function App() {
   const sceneClientRef = useRef<SceneReportClient | null>(null);
   const [streamConnected, setStreamConnected] = useState(false);
   const [hasStreamScene, setHasStreamScene] = useState(false);
+  const [streamLabels, setStreamLabels] = useState<string[]>([]);
+  const [streamObjects, setStreamObjects] = useState<{ label: string; id: string }[]>([]);
 
   // Deriving activeLog directly from the latest logs state ensures UI reactivity
   const activeLog = expandedLogId ? logs.find(l => l.id === expandedLogId) : null;
@@ -217,12 +219,32 @@ export function App() {
     const client = new SceneReportClient(SCENE_REPORT_WS_URL);
     sceneClientRef.current = client;
     client.start();
+    // Live teleport stream bodies to match iPhone's latest OBBs. No-op
+    // until the user clicks Radio and MujocoSim has registered the
+    // current scene's bodies in its stream map.
+    const offUpdate = client.onUpdate((report) => {
+      simRef.current?.applyStreamUpdate(report);
+    });
     const poll = window.setInterval(() => {
       setStreamConnected(client.connected);
       setHasStreamScene(client.latest !== null);
+      const rawObjs = client.latest?.objects ?? [];
+      const objs = rawObjs.map((o) => ({ label: o.label, id: o.id }));
+      const unique = Array.from(new Set(objs.map((o) => o.label))).sort();
+      setStreamLabels((prev) =>
+        prev.length === unique.length && prev.every((l, i) => l === unique[i]) ? prev : unique
+      );
+      setStreamObjects((prev) => {
+        if (prev.length !== objs.length) return objs;
+        for (let i = 0; i < prev.length; i++) {
+          if (prev[i].id !== objs[i].id || prev[i].label !== objs[i].label) return objs;
+        }
+        return prev;
+      });
     }, 500);
     return () => {
       window.clearInterval(poll);
+      offUpdate();
       client.dispose();
       sceneClientRef.current = null;
     };
@@ -252,6 +274,23 @@ export function App() {
         setIsLoading(false);
       }
     }
+  };
+
+  /// Direct-pickup path: bypass Gemini and target a specific tracked body
+  /// by its Boxer3D UUID. Cleaner than routing a unique instance through a
+  /// VLM that can't distinguish identical-looking meshes.
+  const handleDirectPick = (label: string, trackId: string) => {
+    if (!simRef.current) return;
+    const pos = simRef.current.getStreamBodyPosition(label, trackId);
+    if (!pos) return;
+    simRef.current.renderSys.clearErMarkers();
+    detectedTargets.current = [];
+    setIsPickingUp(false);
+    setPlaybackSpeed(1);
+    const markerId = Date.now() + Math.random();
+    simRef.current.renderSys.addErMarker(pos, label, markerId);
+    detectedTargets.current.push({ pos, markerId });
+    setDetectedCount(1);
   };
 
   const toggleDarkMode = () => {
@@ -389,10 +428,10 @@ export function App() {
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               result.forEach((item: any) => {
                   let center2d: {x: number, y: number} | null = null;
-                  if (item.box_2d) {
-                      const [ymin, xmin, ymax, xmax] = item.box_2d; 
+                  if (Array.isArray(item?.box_2d) && item.box_2d.length === 4) {
+                      const [ymin, xmin, ymax, xmax] = item.box_2d;
                       center2d = { x: (xmin + xmax) / 2, y: (ymin + ymax) / 2 };
-                  } else if (item.point) {
+                  } else if (Array.isArray(item?.point) && item.point.length === 2) {
                       const [y, x] = item.point;
                       center2d = { x, y };
                   }
@@ -533,7 +572,7 @@ export function App() {
             hasStreamScene={hasStreamScene}
           />
           
-          <UnifiedSidebar 
+          <UnifiedSidebar
             isOpen={showSidebar}
             onClose={() => setShowSidebar(false)}
             onSend={handleErSend}
@@ -545,6 +584,9 @@ export function App() {
             isDarkMode={isDarkMode}
             isPickingUp={isPickingUp}
             playbackSpeed={playbackSpeed}
+            streamLabels={streamLabels}
+            streamObjects={streamObjects}
+            onDirectPick={handleDirectPick}
           />
 
           {/* Expanded View Modal - Overlay everything */}

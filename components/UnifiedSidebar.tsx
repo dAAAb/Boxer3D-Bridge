@@ -20,24 +20,30 @@ interface UnifiedSidebarProps {
   isDarkMode: boolean;
   isPickingUp?: boolean;
   playbackSpeed?: number;
+  streamLabels?: string[];
+  streamObjects?: { label: string; id: string }[];
+  onDirectPick?: (label: string, trackId: string) => void;
 }
 
 /**
  * UnifiedSidebar
  * The main control panel for the application.
  */
-export function UnifiedSidebar({ 
-  isOpen, 
-  onClose, 
-  onSend, 
-  onPickup, 
-  isLoading, 
-  hasDetectedItems, 
-  logs, 
-  onOpenLog, 
+export function UnifiedSidebar({
+  isOpen,
+  onClose,
+  onSend,
+  onPickup,
+  isLoading,
+  hasDetectedItems,
+  logs,
+  onOpenLog,
   isDarkMode,
   isPickingUp = false,
-  playbackSpeed = 1
+  playbackSpeed = 1,
+  streamLabels = [],
+  streamObjects = [],
+  onDirectPick,
 }: UnifiedSidebarProps) {
   const [prompt, setPrompt] = useState('red cubes');
   const [type, setType] = useState<DetectType>('Segmentation masks');
@@ -134,8 +140,51 @@ export function UnifiedSidebar({
 
         {/* Prompt Input & Action Row */}
         <section className="space-y-2">
+          {streamLabels.length > 0 && (
+            <div className="relative">
+              <select
+                value=""
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v.startsWith('track:')) {
+                    // Direct pickup path — bypass Gemini. Value format:
+                    //   `track:{label}:{trackId}`.
+                    const [, label, trackId] = v.split(':');
+                    onDirectPick?.(label, trackId);
+                  } else if (v) {
+                    setPrompt(v);
+                  }
+                  e.target.value = '';
+                }}
+                className={`appearance-none w-full rounded-xl border px-3 py-2 pr-8 text-xs font-bold transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500/20 cursor-pointer ${inputBg} ${isDarkMode ? 'border-white/10' : 'border-slate-200/80'}`}
+                title="Label → Gemini VLM flow. Specific track → bypass Gemini, directly mark that body for pickup."
+              >
+                <option value="" disabled>
+                  Pick a detected label ({streamLabels.length}) or track ({streamObjects.length})
+                </option>
+                <optgroup label="All of type (via Gemini)">
+                  {streamLabels.map((l) => (
+                    <option key={`label-${l}`} value={l}>{l}</option>
+                  ))}
+                </optgroup>
+                {onDirectPick && streamObjects.length > 0 && (
+                  <optgroup label="Specific track (direct, skips Gemini)">
+                    {streamObjects.map((o) => {
+                      const short = o.id.replace(/[^a-zA-Z0-9]/g, '').slice(0, 4).toUpperCase();
+                      return (
+                        <option key={`track-${o.id}`} value={`track:${o.label}:${o.id}`}>
+                          {o.label} #{short}
+                        </option>
+                      );
+                    })}
+                  </optgroup>
+                )}
+              </select>
+              <ChevronDown className={`absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 pointer-events-none ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`} />
+            </div>
+          )}
           <div className="relative group">
-            <textarea 
+            <textarea
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 className={`w-full rounded-2xl px-4 py-3 pr-10 text-sm focus:outline-none transition-all resize-none h-12 border ${inputBg}`}
