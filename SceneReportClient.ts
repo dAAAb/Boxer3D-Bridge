@@ -37,9 +37,21 @@ export class SceneReportClient {
       this.connected = true;
       console.log('[SceneReportClient] connected', this.url);
     };
-    this.ws.onmessage = (ev) => {
+    this.ws.binaryType = 'arraybuffer';
+    this.ws.onmessage = async (ev) => {
       try {
-        const report = JSON.parse(ev.data as string) as SceneReport;
+        let text: string;
+        if (typeof ev.data === 'string') {
+          text = ev.data;
+        } else if (ev.data instanceof ArrayBuffer) {
+          text = new TextDecoder().decode(ev.data);
+        } else if (ev.data instanceof Blob) {
+          text = await ev.data.text();
+        } else {
+          console.warn('[SceneReportClient] unknown payload type', ev.data);
+          return;
+        }
+        const report = JSON.parse(text) as SceneReport;
         this.latest = report;
         this.listeners.forEach((l) => l(report));
       } catch (e) {
