@@ -10,10 +10,13 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { v4 as uuidv4 } from 'uuid';
 import { MujocoSim } from './MujocoSim';
+import { SceneReportClient } from './SceneReportClient';
 import { RobotSelector } from './components/RobotSelector';
 import { Toolbar } from './components/Toolbar';
 import { UnifiedSidebar } from './components/UnifiedSidebar';
 import { DetectedItem, DetectType, LogEntry, MujocoModule } from './types';
+
+const SCENE_REPORT_WS_URL = 'ws://localhost:8787';
 
 /**
  * Default prompt parts for different detection types.
@@ -110,6 +113,10 @@ export function App() {
 
   const [gizmoStats, setGizmoStats] = useState<{pos: string, rot: string} | null>(null);
 
+  const sceneClientRef = useRef<SceneReportClient | null>(null);
+  const [streamConnected, setStreamConnected] = useState(false);
+  const [hasStreamScene, setHasStreamScene] = useState(false);
+
   // Deriving activeLog directly from the latest logs state ensures UI reactivity
   const activeLog = expandedLogId ? logs.find(l => l.id === expandedLogId) : null;
 
@@ -205,6 +212,47 @@ export function App() {
       uiLoop();
       return () => cancelAnimationFrame(animId);
   }, [isLoading]);
+
+  useEffect(() => {
+    const client = new SceneReportClient(SCENE_REPORT_WS_URL);
+    sceneClientRef.current = client;
+    client.start();
+    const poll = window.setInterval(() => {
+      setStreamConnected(client.connected);
+      setHasStreamScene(client.latest !== null);
+    }, 500);
+    return () => {
+      window.clearInterval(poll);
+      client.dispose();
+      sceneClientRef.current = null;
+    };
+  }, []);
+
+  const handleReloadFromStream = async () => {
+    const scene = sceneClientRef.current?.latest;
+    if (!scene || !simRef.current) return;
+    setIsLoading(true);
+    setLoadingStatus('Reloading sim from SceneReport...');
+    setLogs([]);
+    setDetectedCount(0);
+    setIsPickingUp(false);
+    setPlaybackSpeed(1);
+    detectedTargets.current = [];
+    try {
+      await simRef.current.reloadWithScene(scene, (msg) => {
+        if (isMounted.current) setLoadingStatus(msg);
+      });
+      if (isMounted.current) {
+        simRef.current.setIkEnabled(false);
+        setIsLoading(false);
+      }
+    } catch (err: unknown) {
+      if (isMounted.current) {
+        setLoadError((err as Error).message);
+        setIsLoading(false);
+      }
+    }
+  };
 
   const toggleDarkMode = () => {
     const next = !isDarkMode;
@@ -472,14 +520,17 @@ export function App() {
       {/* Main UI Controls */}
       {!isLoading && !loadError && (
         <>
-          <Toolbar 
-            isPaused={isPaused} 
-            togglePause={() => setIsPaused(simRef.current?.togglePause() ?? false)} 
-            onReset={handleReset} 
+          <Toolbar
+            isPaused={isPaused}
+            togglePause={() => setIsPaused(simRef.current?.togglePause() ?? false)}
+            onReset={handleReset}
             showSidebar={showSidebar}
             toggleSidebar={() => setShowSidebar(!showSidebar)}
             isDarkMode={isDarkMode}
             toggleDarkMode={toggleDarkMode}
+            onReloadFromStream={handleReloadFromStream}
+            streamConnected={streamConnected}
+            hasStreamScene={hasStreamScene}
           />
           
           <UnifiedSidebar 

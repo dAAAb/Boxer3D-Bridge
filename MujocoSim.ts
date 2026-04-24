@@ -9,6 +9,7 @@ import { DragStateManager } from './DragStateManager';
 import { IkSystem } from './IkSystem';
 import { RenderSystem } from './RenderSystem';
 import { RobotLoader } from './RobotLoader';
+import { SceneReport } from './SceneReport';
 import { SelectionManager } from './SelectionManager';
 import { SequenceAnimator } from './SequenceAnimator';
 import { MujocoData, MujocoModel, MujocoModule } from './types';
@@ -30,10 +31,13 @@ export class MujocoSim {
     selectionManager: SelectionManager;
     sequenceAnimator: SequenceAnimator;
 
-    frameId: number | null = null; 
+    frameId: number | null = null;
     paused = false;
     gripperActuatorId = -1;
     speedMultiplier = 1;
+
+    private currentRobotId = 'franka_emika_panda';
+    private currentSceneFile = 'scene.xml';
     
     private userIkEnabled = false; 
     private firstIkEnable = true; // Track first enable to enforce default rotation
@@ -68,6 +72,8 @@ export class MujocoSim {
     }
 
     async init(robotId = 'franka_emika_panda', sceneFile = 'scene.xml', onProgress?: (msg: string) => void) {
+        this.currentRobotId = robotId;
+        this.currentSceneFile = sceneFile;
         const loader = new RobotLoader(this.mujoco);
         const { isDouble, isStacking } = await loader.load(robotId, sceneFile, onProgress);
 
@@ -298,6 +304,57 @@ export class MujocoSim {
             );
             this.setIkEnabled(false);
         }
+    }
+
+    async reloadWithScene(sceneReport: SceneReport, onProgress?: (msg: string) => void) {
+        if (this.frameId !== null) {
+            cancelAnimationFrame(this.frameId);
+            this.frameId = null;
+        }
+        this.sequenceAnimator.reset();
+        this.renderSys.clearErMarkers();
+
+        for (const b of this.renderSys.bodies) this.renderSys.simGroup.remove(b);
+        this.renderSys.bodies = [];
+
+        if (this.mjData) { this.mjData.delete(); this.mjData = null; }
+        if (this.mjModel) { this.mjModel.delete(); this.mjModel = null; }
+
+        const loader = new RobotLoader(this.mujoco);
+        const { isDouble, isStacking } = await loader.load(this.currentRobotId, this.currentSceneFile, onProgress, sceneReport);
+
+        try {
+            this.mjModel = this.mujoco.MjModel.loadFromXML(`/working/${this.currentSceneFile}`);
+            this.mjData = new this.mujoco.MjData(this.mjModel);
+        } catch (e: unknown) {
+            throw new Error(`Failed to reload with scene: ${(e as Error).message}`);
+        }
+
+        this.ikSys.gripperSiteId = -1;
+        this.gripperActuatorId = -1;
+        for (let i = 0; i < this.mjModel.nsite; i++) {
+            if (getName(this.mjModel, this.mjModel.name_siteadr[i]).includes('tcp')) {
+                this.ikSys.gripperSiteId = i; break;
+            }
+        }
+        for (let i = 0; i < this.mjModel.nu; i++) {
+            if (getName(this.mjModel, this.mjModel.name_actuatoradr[i]).includes('gripper')) {
+                this.gripperActuatorId = i; break;
+            }
+        }
+
+        this.setInitialPose();
+        this.mujoco.mj_forward(this.mjModel, this.mjData!);
+        this.renderSys.initScene(this.mjModel);
+        this.ikSys.init(this.mjModel, isDouble);
+        this.ikSys.syncToSite(this.mjData!);
+
+        this.ikSys.target.quaternion.setFromEuler(new THREE.Euler(Math.PI, 0, 0));
+        this.ikSys.target.position.set(0, 0, 0.45);
+        this.firstIkEnable = true;
+
+        this.sequenceAnimator.init(this.mjModel, isStacking, (addr) => getName(this.mjModel!, addr));
+        this.startLoop();
     }
 
     reset() {

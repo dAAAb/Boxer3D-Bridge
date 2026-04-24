@@ -4,6 +4,7 @@
 */
 
 
+import { SceneReport, sceneReportToMjcf } from "./SceneReport";
 import { MujocoModule } from "./types";
 
 /**
@@ -22,7 +23,7 @@ export class RobotLoader {
      * Main entry point. Downloads the main scene XML and recursively finds/downloads all included files.
      * @param onProgress Optional callback to report loading progress string.
      */
-    async load(robotId: string, sceneFile: string, onProgress?: (msg: string) => void): Promise<{ isDouble: boolean, isStacking: boolean }> {
+    async load(robotId: string, sceneFile: string, onProgress?: (msg: string) => void, sceneReport?: SceneReport): Promise<{ isDouble: boolean, isStacking: boolean }> {
         // 1. Clean up the virtual filesystem from previous runs
         try { this.mujoco.FS.unmount('/working'); } catch (e) { /* ignore */ }
         try { this.mujoco.FS.mkdir('/working'); } catch (e) { /* ignore */ }
@@ -68,7 +69,7 @@ export class RobotLoader {
             // If it's an XML, we might need to patch it and scan it for more dependencies
             if (fname.endsWith('.xml')) {
                 let text = await res.text();
-                text = this.patchSingleRobot(fname, sceneFile, isStacking, text);
+                text = this.patchSingleRobot(fname, sceneFile, isStacking, text, sceneReport);
                 
                 // Write text file to virtual FS
                 this.mujoco.FS.writeFile(`/working/${fname}`, text);
@@ -84,10 +85,13 @@ export class RobotLoader {
     }
 
     // Modifies the standard XMLs to add our specific demo objects (cubes, trays)
-    private patchSingleRobot(fname: string, sceneFile: string, isStacking: boolean, text: string): string {
+    private patchSingleRobot(fname: string, sceneFile: string, isStacking: boolean, text: string, sceneReport?: SceneReport): string {
         if (fname === sceneFile) {
             let injection = '';
-            if (isStacking) {
+            if (sceneReport && sceneReport.objects.length > 0) {
+                // Boxer3D stream mode: inject OBBs from SceneReport instead of fixed demo objects.
+                injection = sceneReportToMjcf(sceneReport);
+            } else if (isStacking) {
                 const colors = [
                     '0.8 0.1 0.1 1', // Red
                     '0.0 0.8 0.8 1', // Cyan (Changed from Blue)
