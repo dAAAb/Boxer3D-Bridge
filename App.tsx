@@ -532,18 +532,16 @@ export function App() {
     setIsPickingUp(false);
   };
 
-  // Stage 1 of the pipeline. Two execution paths:
+  // Stage 1 of the pipeline. Always runs the full cinematic VLM flow
+  // (camera-down, flash, sim snapshot, Gemini call, place blue cones)
+  // so the user sees what's happening on every Detect press.
   //
-  //  (a) Stream bodies present in sim → existing Gemini-on-real-RGB flow
-  //      via detectImpl (request iPhone frame, send to Gemini,
-  //      project-match detections to track UUIDs, place markers).
-  //  (b) No stream bodies → synthesise the SceneReport directly from
-  //      current MuJoCo bodies. No VLM perception needed: we already
-  //      know every cube's exact world position from the sim. Lets the
-  //      user run Plan/Execute against the default 20-cube scene before
-  //      ever pressing Radio, and avoids a 30+ s VLM detour when bridge
-  //      is up but no real iPhone is publishing (fake_publisher / no
-  //      Radio yet).
+  // For sim-only scenes (no iPhone Radio'd in) we ALSO synthesise a
+  // SceneReport from MuJoCo bodies up-front and stash it as
+  // lastDetectScene. Plan stage uses this rich symbolic state — every
+  // cube's track_id and exact world position — instead of trying to
+  // reconstruct it from Gemini's 2D output. So even if Gemini's
+  // detection is noisy or slow, Plan still has ground truth.
   const runDetectStage = async (
     prompt: string,
     type: DetectType,
@@ -553,24 +551,14 @@ export function App() {
   ): Promise<void> => {
     if (!simRef.current) throw new Error('Detect: sim not ready');
 
-    // Path discriminator: do any stream bodies exist in the sim? If not,
-    // there's nothing the VLM can usefully detect for us — Gemini would
-    // just see synthetic white meshes and the JPEG round-trip is wasted.
-    // hasStreamBodies replaces the older streamConnected check, which
-    // was wrong: bridge can be 'connected' (browser ↔ relay) yet no
-    // iPhone publishing, no useful image to send.
+    // Pre-populate synthetic scene when we have no stream bodies — gives
+    // Plan stage rich track_id info regardless of VLM outcome.
     const hasStreamBodies = (simRef.current.getStreamBodyKeys().size ?? 0) > 0;
-
     if (!hasStreamBodies) {
       const synthetic = simRef.current.synthesizeSceneFromBodies();
-      if (!synthetic || synthetic.objects.length === 0) {
-        throw new Error('Detect: no stream bodies and no synthesisable bodies in sim');
-      }
-      lastDetectScene.current = synthetic;
-      return;
+      if (synthetic) lastDetectScene.current = synthetic;
     }
 
-    // Path (a): full VLM detection.
     setErLoading(true);
     try {
       await detectImpl(prompt, type, temperature, enableThinking, modelId);
