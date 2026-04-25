@@ -437,6 +437,15 @@ export class MujocoSim {
         }
     }
 
+    /// Snapshot of the body names currently injected from the stream.
+    /// Used by App.tsx to decide whether the "sync" toolbar dot should
+    /// pulse — when the stream has track UUIDs the sim doesn't know
+    /// about (e.g. BoxerNet's MOT reaped + respawned a track), we want
+    /// to nudge the user to press Radio.
+    getStreamBodyKeys(): Set<string> {
+        return new Set(this.streamBodyMap.keys());
+    }
+
     /// Look up the current world position of a stream-injected body by its
     /// label + track UUID. Returns null if the track isn't in the current
     /// scene — caller should fall back to Gemini or prompt a reload. Used

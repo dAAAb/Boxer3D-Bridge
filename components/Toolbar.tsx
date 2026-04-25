@@ -17,6 +17,7 @@ interface ToolbarProps {
   onReloadFromStream?: () => void;
   streamConnected?: boolean;
   hasStreamScene?: boolean;
+  streamStale?: boolean;
 }
 
 /**
@@ -34,6 +35,7 @@ export function Toolbar({
   onReloadFromStream,
   streamConnected,
   hasStreamScene,
+  streamStale,
 }: ToolbarProps) {
   const panelStyle = isDarkMode ? "bg-slate-900/80 border-white/10 text-slate-100" : "bg-white/70 border-white/80 text-slate-800";
   const iconFill = isDarkMode ? "fill-slate-100" : "fill-slate-800";
@@ -65,10 +67,26 @@ export function Toolbar({
           onClick={onReloadFromStream}
           disabled={!hasStreamScene}
           className={`relative w-14 h-14 rounded-2xl glass-panel flex items-center justify-center transition-all shadow-xl ${hasStreamScene ? 'hover:scale-105 active:scale-95' : 'opacity-50 cursor-not-allowed'} ${panelStyle}`}
-          title={streamConnected ? (hasStreamScene ? 'Reload sim from Boxer3D SceneReport' : 'Stream connected, waiting for first frame') : 'Boxer3D stream disconnected (ws://localhost:8787)'}
+          title={
+            !streamConnected
+              ? 'Boxer3D stream disconnected (ws://localhost:8787)'
+              : !hasStreamScene
+                ? 'Stream connected, waiting for first frame'
+                : streamStale
+                  ? 'New tracks in stream — sync sim to see them and refresh drifted positions'
+                  : 'Sync sim scene with Boxer3D stream'
+          }
         >
           <Radio className="w-6 h-6" />
-          <span className={`absolute top-1.5 right-1.5 w-2 h-2 rounded-full ${streamConnected ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+          <span
+            className={`absolute top-1.5 right-1.5 w-2 h-2 rounded-full ${
+              !streamConnected
+                ? 'bg-slate-400'
+                : streamStale
+                  ? 'bg-amber-400 animate-pulse'
+                  : 'bg-emerald-500'
+            }`}
+          />
         </button>
       )}
 

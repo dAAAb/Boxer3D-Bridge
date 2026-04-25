@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { v4 as uuidv4 } from 'uuid';
 import { MujocoSim } from './MujocoSim';
-import { SceneObject, SceneReport } from './SceneReport';
+import { SceneObject, SceneReport, streamBodyName } from './SceneReport';
 import { SceneReportClient } from './SceneReportClient';
 import { mujocoToArkit, worldToGemini1000 } from './projection';
 import { RobotSelector } from './components/RobotSelector';
@@ -120,6 +120,11 @@ export function App() {
   const [hasStreamScene, setHasStreamScene] = useState(false);
   const [streamLabels, setStreamLabels] = useState<string[]>([]);
   const [streamObjects, setStreamObjects] = useState<{ label: string; id: string }[]>([]);
+  /// Goes true when the stream has track UUIDs that don't exist in the
+  /// sim's current streamBodyMap — i.e. BoxerNet has surfaced a new or
+  /// respawned track since the last Radio sync. Surfaced as a pulsing
+  /// amber dot on the toolbar nudging the user to re-sync.
+  const [streamStale, setStreamStale] = useState(false);
 
   // Deriving activeLog directly from the latest logs state ensures UI reactivity
   const activeLog = expandedLogId ? logs.find(l => l.id === expandedLogId) : null;
@@ -243,6 +248,18 @@ export function App() {
         }
         return prev;
       });
+      // Stale check: any track UUID in the stream that the sim doesn't
+      // know about? We only flag stale once Radio has been pressed at
+      // least once (sim's streamBodyMap non-empty) — pre-Radio is the
+      // normal "ready to first-sync" state, not staleness.
+      const simKeys = simRef.current?.getStreamBodyKeys();
+      let stale = false;
+      if (simKeys && simKeys.size > 0 && objs.length > 0) {
+        for (const o of objs) {
+          if (!simKeys.has(streamBodyName(o.label, o.id))) { stale = true; break; }
+        }
+      }
+      setStreamStale(stale);
     }, 500);
     return () => {
       window.clearInterval(poll);
@@ -640,6 +657,7 @@ export function App() {
             onReloadFromStream={handleReloadFromStream}
             streamConnected={streamConnected}
             hasStreamScene={hasStreamScene}
+            streamStale={streamStale}
           />
           
           <UnifiedSidebar
