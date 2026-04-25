@@ -30,6 +30,10 @@ export class RenderSystem {
     contactMarkers!: THREE.InstancedMesh; 
     
     erGroup: THREE.Group;
+    /// Ghost-mesh + arrow overlay painted by setPlanPreview after the
+    /// Plan stage completes. Lives at scene root (not simGroup) so it
+    /// doesn't inherit any sim-wide transforms.
+    previewGroup: THREE.Group;
     private raycaster = new THREE.Raycaster();
 
     private dummy = new THREE.Object3D(); 
@@ -78,6 +82,10 @@ export class RenderSystem {
 
         this.erGroup = new THREE.Group();
         this.scene.add(this.erGroup);
+
+        this.previewGroup = new THREE.Group();
+        this.previewGroup.name = '_planPreview';
+        this.scene.add(this.previewGroup);
 
         this.initContactMarkers();
         this.initGrid();
@@ -327,6 +335,73 @@ export class RenderSystem {
         sprite.position.set(0, 0, 0.12);
         sprite.renderOrder = 999;
         return sprite;
+    }
+
+    /// Paint the Tesla-FSD-style ghost overlay: translucent indigo box
+    /// at each cube's predicted final position + an arrow from current
+    /// → predicted. Skips entries that barely move (< 5 cm) to keep
+    /// the scene readable. Caller (App.tsx via MujocoSim) supplies a
+    /// flat list of items computed from predictPlanFinalPositions.
+    setPlanPreview(items: { trackId: string; currentPos: THREE.Vector3; finalPos: THREE.Vector3; size: [number, number, number]; label?: string }[]) {
+        this.clearPlanPreview();
+        for (const it of items) {
+            const dist = it.currentPos.distanceTo(it.finalPos);
+            if (dist < 0.05) continue;
+
+            // Ghost box at predicted final position.
+            const [w, h, d] = it.size;
+            const geom = new THREE.BoxGeometry(w, h, d);
+            const mat = new THREE.MeshStandardMaterial({
+                color: 0x6366f1,
+                transparent: true,
+                opacity: 0.32,
+                emissive: 0x4f46e5,
+                emissiveIntensity: 0.4,
+                depthWrite: false,
+                roughness: 0.4,
+                metalness: 0.1,
+            });
+            const ghost = new THREE.Mesh(geom, mat);
+            ghost.position.copy(it.finalPos);
+            ghost.renderOrder = 999;
+            ghost.userData.isPlanPreview = true;
+            this.previewGroup.add(ghost);
+
+            // Arrow from current → predicted, lifted slightly so it
+            // doesn't z-fight with the floor or the cubes.
+            const dir = it.finalPos.clone().sub(it.currentPos);
+            const len = dir.length();
+            dir.normalize();
+            const origin = it.currentPos.clone();
+            origin.z += Math.max(it.size[2] / 2, 0.02);
+            const arrow = new THREE.ArrowHelper(dir, origin, len, 0x6366f1, Math.min(0.05, len * 0.3), Math.min(0.025, len * 0.15));
+            arrow.line.material.transparent = true;
+            (arrow.line.material as THREE.LineBasicMaterial).opacity = 0.85;
+            (arrow.cone.material as THREE.MeshBasicMaterial).transparent = true;
+            (arrow.cone.material as THREE.MeshBasicMaterial).opacity = 0.85;
+            (arrow.line.material as THREE.LineBasicMaterial).depthTest = false;
+            (arrow.cone.material as THREE.MeshBasicMaterial).depthTest = false;
+            arrow.renderOrder = 999;
+            this.previewGroup.add(arrow);
+        }
+    }
+
+    clearPlanPreview() {
+        // Dispose geometry + material on every child to avoid leaking
+        // GPU resources. ArrowHelper has line + cone children with their
+        // own materials; .traverse covers them.
+        this.previewGroup.traverse((obj) => {
+            const m = obj as THREE.Mesh;
+            if (m.geometry) m.geometry.dispose?.();
+            if (m.material) {
+                if (Array.isArray(m.material)) m.material.forEach((mat) => mat.dispose());
+                else (m.material as THREE.Material).dispose();
+            }
+        });
+        // THREE.Group doesn't have a clear() that disposes; remove children explicitly.
+        while (this.previewGroup.children.length > 0) {
+            this.previewGroup.remove(this.previewGroup.children[0]);
+        }
     }
 
     clearErMarkers() { this.erGroup.clear(); }
