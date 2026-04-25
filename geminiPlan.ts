@@ -5,7 +5,10 @@
 
 import { GoogleGenAI } from '@google/genai';
 import { FUNCTION_LIBRARY_DOCS, RobotFunctionCall } from './actionLibrary';
+import { buildPlannerSystemPrompt, PLANNER_PROMPT_VERSION } from './prompts/planner.system';
 import { SceneObject } from './SceneReport';
+
+export { PLANNER_PROMPT_VERSION };
 
 export interface PlanResult {
   calls: RobotFunctionCall[];
@@ -42,18 +45,21 @@ export async function planActions(
     })
     .join('\n');
 
+  const systemPrompt = buildPlannerSystemPrompt(FUNCTION_LIBRARY_DOCS);
   const prompt = [
-    FUNCTION_LIBRARY_DOCS,
+    systemPrompt,
     '',
-    'Detected objects (current scene):',
+    '## Current scene',
+    'Detected objects:',
     objectList || '  (none)',
     '',
     opts.image
-      ? 'The attached image is the iPhone RGB view of the scene above. Use it to disambiguate visual qualifiers in the task (colour, branding, position) — every object in the list has a visible counterpart in the image. Match by spatial location.'
-      : '',
-    `User task: "${task}"`,
+      ? 'An iPhone RGB image of this scene is attached above. Use it for visual qualifiers per the rules.'
+      : 'No image available — reason from labels and positions only.',
     '',
-    'Output the JSON array of function calls now. No explanation, just the array.',
+    `## User task\n"${task}"`,
+    '',
+    'Output the JSON array now.',
   ].filter(Boolean).join('\n');
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
