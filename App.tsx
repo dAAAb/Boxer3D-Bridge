@@ -10,7 +10,9 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { v4 as uuidv4 } from 'uuid';
 import { MujocoSim } from './MujocoSim';
+import { SceneObject, SceneReport } from './SceneReport';
 import { SceneReportClient } from './SceneReportClient';
+import { mujocoToArkit, worldToGemini1000 } from './projection';
 import { RobotSelector } from './components/RobotSelector';
 import { Toolbar } from './components/Toolbar';
 import { UnifiedSidebar } from './components/UnifiedSidebar';
@@ -317,56 +319,78 @@ export function App() {
       if (!simRef.current || erLoading) return;
       setErLoading(true);
       simRef.current.renderSys.clearErMarkers();
-      detectedTargets.current = []; 
+      detectedTargets.current = [];
       setDetectedCount(0);
       setIsPickingUp(false);
       setPlaybackSpeed(1);
 
-      const savedState = simRef.current.renderSys.getCameraState();
-      const topPos = new THREE.Vector3(0, -0.01, 2.0); 
-      const target = new THREE.Vector3(0, 0, 0);
-      await simRef.current.renderSys.moveCameraTo(topPos, target, 1500);
-      await new Promise(r => setTimeout(r, 100)); 
+      // Source the input image from the iPhone Boxer3D stream when available.
+      // Falls back to the top-down sim canvas snapshot when the stream is
+      // disconnected or the request times out.
+      const sceneClient = sceneClientRef.current;
+      let frameReport: SceneReport | null = null;
+      if (sceneClient && streamConnected) {
+          try {
+              frameReport = await sceneClient.requestFrame(2500);
+          } catch (err) {
+              console.warn('[handleErSend] iPhone frame request failed, falling back to sim canvas:', err);
+              frameReport = null;
+          }
+      }
+      const useIphoneImage = frameReport?.image != null;
 
-      setFlash(true);
-      setTimeout(() => setFlash(false), 100);
-      
-      // Dynamic Resizing: Limit max dimension to 640px while preserving aspect ratio.
-      const canvas = simRef.current.renderSys.renderer.domElement;
-      const width = canvas.width;
-      const height = canvas.height;
-      const scaleFactor = Math.min(640 / width, 640 / height);
-      const snapshotWidth = Math.floor(width * scaleFactor);
-      const snapshotHeight = Math.floor(height * scaleFactor);
-      
-      // Serialization: Convert to PNG.
-      const imageBase64 = simRef.current.renderSys.getCanvasSnapshot(snapshotWidth, snapshotHeight, 'image/png');
-      // Payload Preparation: Strip data URI prefix.
-      const base64Data = imageBase64.replace('data:image/png;base64,', '');
+      let imageBase64: string;
+      let base64Data: string;
+      let imageMimeType: string;
+      // Saved camera state only needs restoring when we actually moved it.
+      let savedCameraState: { position: THREE.Vector3; target: THREE.Vector3 } | null = null;
+      const topPos = new THREE.Vector3(0, -0.01, 2.0);
+      const fallbackTarget = new THREE.Vector3(0, 0, 0);
+
+      if (useIphoneImage && frameReport!.image) {
+          // iPhone real-RGB path: use the JPEG ARFrame straight, leave the
+          // sim camera alone (Gemini sees the iPhone's view, sim camera is
+          // for the operator).
+          const img = frameReport!.image;
+          base64Data = img.base64;
+          imageMimeType = img.mime;
+          imageBase64 = `data:${img.mime};base64,${img.base64}`;
+      } else {
+          // Sim-canvas fallback: the original demo path, top-down PNG snapshot.
+          savedCameraState = simRef.current.renderSys.getCameraState();
+          await simRef.current.renderSys.moveCameraTo(topPos, fallbackTarget, 1500);
+          await new Promise(r => setTimeout(r, 100));
+          setFlash(true);
+          setTimeout(() => setFlash(false), 100);
+          const canvas = simRef.current.renderSys.renderer.domElement;
+          const w = canvas.width;
+          const h = canvas.height;
+          const sf = Math.min(640 / w, 640 / h);
+          imageBase64 = simRef.current.renderSys.getCanvasSnapshot(Math.floor(w * sf), Math.floor(h * sf), 'image/png');
+          base64Data = imageBase64.replace('data:image/png;base64,', '');
+          imageMimeType = 'image/png';
+      }
 
       const parts = defaultPromptParts[type];
       const subject = prompt.trim() || parts[1];
       const textPrompt = `${parts[0]} ${subject}${parts[2]}`;
-      
+
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const config: any = {
           temperature,
           responseMimeType: "application/json",
       };
-
-      if (!enableThinking) {
-          config.thinkingConfig = { thinkingBudget: 0 };
-      }
+      if (!enableThinking) config.thinkingConfig = { thinkingBudget: 0 };
 
       const requestLogData = {
           model: modelId,
           contents: {
               parts: [
-                  { inlineData: { data: "<IMAGE>", mimeType: "image/png" } },
+                  { inlineData: { data: "<IMAGE>", mimeType: imageMimeType } },
                   { text: textPrompt }
               ]
           },
-          config: config
+          config,
       };
 
       const logId = uuidv4();
@@ -377,12 +401,14 @@ export function App() {
           prompt,
           fullPrompt: textPrompt,
           type,
-          result: null, 
-          requestData: requestLogData
+          result: null,
+          requestData: requestLogData,
       };
       setLogs(prev => [newLog, ...prev]);
 
-      await simRef.current.renderSys.moveCameraTo(savedState.position, savedState.target, 1500);
+      if (savedCameraState) {
+          await simRef.current.renderSys.moveCameraTo(savedCameraState.position, savedCameraState.target, 1500);
+      }
 
       try {
           const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -390,12 +416,12 @@ export function App() {
               model: modelId,
               contents: {
                   parts: [
-                      { inlineData: { mimeType: 'image/png', data: base64Data } },
+                      { inlineData: { mimeType: imageMimeType, data: base64Data } },
                       { text: textPrompt }
                   ]
               },
               // tslint:disable-next-line:no-any
-              config: config
+              config: config,
           });
 
           const text = response.text;
@@ -411,7 +437,6 @@ export function App() {
           let result;
           try { result = JSON.parse(jsonText); } catch (e) { result = []; }
 
-          // Remove absolute duplicates
           if (Array.isArray(result)) {
               const seen = new Set();
               result = result.filter((item: unknown) => {
@@ -424,6 +449,25 @@ export function App() {
 
           setLogs(prev => prev.map(l => l.id === logId ? { ...l, result } : l));
 
+          // Pre-project all OBBs into Gemini's 0-1000 image space, ONCE per
+          // Detect call (vs. per-result iteration). Only meaningful on the
+          // iPhone path — sim canvas raycast doesn't need projection.
+          let obbProjections: { obj: SceneObject; gx: number; gy: number }[] | null = null;
+          if (useIphoneImage && frameReport!.camera_intrinsics && frameReport!.camera?.pose_world) {
+              const intr = frameReport!.camera_intrinsics.fxfycxcy;
+              const imgSize = frameReport!.camera_intrinsics.image_size_native;
+              const camPose = frameReport!.camera.pose_world;
+              const yawDeg = frameReport!.world_yaw_deg ?? 0;
+              obbProjections = [];
+              for (const obj of frameReport!.objects) {
+                  // Objects come in MuJoCo frame; camera pose is ARKit frame.
+                  // Invert the swap to put both in the same frame.
+                  const arkitPoint = mujocoToArkit(obj.center_world, yawDeg);
+                  const proj = worldToGemini1000(arkitPoint, camPose, intr, imgSize);
+                  if (proj) obbProjections.push({ obj, gx: proj.gx, gy: proj.gy });
+              }
+          }
+
           if (Array.isArray(result)) {
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               result.forEach((item: any) => {
@@ -435,14 +479,40 @@ export function App() {
                       const [y, x] = item.point;
                       center2d = { x, y };
                   }
+                  if (!center2d) return;
 
-                  if (center2d) {
-                      const projection = simRef.current?.renderSys.project2DTo3D(center2d.x, center2d.y, topPos, target);
-                      if (projection) {
-                          const markerId = Date.now() + Math.random();
-                          simRef.current?.renderSys.addErMarker(projection.point, item.label, markerId);
-                          detectedTargets.current.push({ pos: projection.point, markerId });
+                  // Path 1 — iPhone projection match: find the OBB whose
+                  // pre-projected gx/gy is closest to Gemini's detection.
+                  // Threshold 80 in 0-1000 space ≈ 8% of image side; beyond
+                  // that we assume Gemini saw something we don't track.
+                  if (obbProjections && obbProjections.length > 0) {
+                      let best: { obj: SceneObject; dist: number } | null = null;
+                      for (const p of obbProjections) {
+                          const d = Math.hypot(p.gx - center2d.x, p.gy - center2d.y);
+                          if (!best || d < best.dist) best = { obj: p.obj, dist: d };
                       }
+                      if (best && best.dist < 80) {
+                          const pos = simRef.current?.getStreamBodyPosition(best.obj.label, best.obj.id);
+                          if (pos) {
+                              const markerId = Date.now() + Math.random();
+                              simRef.current?.renderSys.addErMarker(pos, best.obj.label, markerId);
+                              detectedTargets.current.push({ pos, markerId });
+                              return;
+                          }
+                      }
+                  }
+
+                  // Path 2 — sim-canvas raycast fallback (existing demo logic).
+                  // Only meaningful when Gemini saw the sim canvas, not when
+                  // it saw the iPhone image — projecting the iPhone-frame
+                  // pixel through a top-down sim camera doesn't recover the
+                  // original 3D point. We still try, because it's better than
+                  // nothing if projection match found nothing.
+                  const projection = simRef.current?.renderSys.project2DTo3D(center2d.x, center2d.y, topPos, fallbackTarget);
+                  if (projection) {
+                      const markerId = Date.now() + Math.random();
+                      simRef.current?.renderSys.addErMarker(projection.point, item.label, markerId);
+                      detectedTargets.current.push({ pos: projection.point, markerId });
                   }
               });
               setDetectedCount(detectedTargets.current.length);

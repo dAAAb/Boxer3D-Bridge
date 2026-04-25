@@ -74,3 +74,34 @@ export function worldToGemini1000(
   const { gx, gy } = pixelToGemini1000(px.u, px.v, imageSizeNative);
   return { gx, gy, depth: px.depth };
 }
+
+/**
+ * Inverse of `BridgeCoord.arkitToMujoco` from the iPhone side. Used to
+ * convert an OBB centre (which arrives in MuJoCo frame for sim injection)
+ * back into ARKit-world frame so it can be projected through the iPhone
+ * camera (which arrives in ARKit-world frame). Mirror of:
+ *
+ *   mujocoX = -arkitZ   (then yawDeg rotation around +Z)
+ *   mujocoY = -arkitX
+ *   mujocoZ =  arkitY
+ *
+ * Inverted: undo yaw first (because it was applied AFTER the basic swap
+ * on the iOS side), then undo the basic swap.
+ */
+export function mujocoToArkit(
+  p: [number, number, number],
+  yawDeg: number,
+): [number, number, number] {
+  let bx = p[0];
+  let by = p[1];
+  const norm = ((yawDeg % 360) + 360) % 360;
+  switch (norm) {
+    case 90:  bx =  p[1]; by = -p[0]; break;
+    case 180: bx = -p[0]; by = -p[1]; break;
+    case 270: bx = -p[1]; by =  p[0]; break;
+    // case 0: bx, by unchanged
+  }
+  // After yaw undo, (bx, by, p[2]) is the post-basic-swap MuJoCo point.
+  // Now invert the basic swap.
+  return [-by, p[2], -bx];
+}

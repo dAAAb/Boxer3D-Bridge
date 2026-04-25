@@ -29,10 +29,21 @@ export interface SceneImage {
   height: number;
 }
 
+export interface SceneCamera {
+  /// 4×4 column-major (16 floats). Currently in **ARKit world** frame
+  /// — i.e., the raw `ARFrame.camera.transform`. Note this disagrees
+  /// with `coordinate_frame: "mujoco_world"` for objects[]; the browser
+  /// undoes the swap via `mujocoToArkit` before projecting OBBs through
+  /// this pose.
+  pose_world?: number[];
+  image_size?: [number, number];
+}
+
 export interface SceneReport {
   version?: number;
   timestamp: number;
   coordinate_frame?: string;
+  camera?: SceneCamera;
   objects: SceneObject[];
   /// Camera pose (4×4 column-major in `camera.pose_world`) is sent every
   /// tick. Intrinsics are also sent every tick (cheap, 4 floats); image
@@ -40,6 +51,11 @@ export interface SceneReport {
   /// otherwise this stays undefined to keep regular ticks tiny.
   camera_intrinsics?: CameraIntrinsics;
   image?: SceneImage;
+  /// The yawDeg picker value the iPhone applied to objects[].center_world.
+  /// Browser needs this to undo the swap when projecting OBBs back into
+  /// the iPhone image (camera.pose_world is in ARKit frame, objects are
+  /// in MuJoCo frame post-swap).
+  world_yaw_deg?: number;
 }
 
 /// Body name convention for bridge-injected OBBs: `stream_{label}_{trackId}`.
