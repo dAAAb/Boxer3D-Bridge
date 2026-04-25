@@ -449,9 +449,17 @@ export function UnifiedSidebar({
                     onClick={() => onOpenLog(log)}
                     className={`group flex gap-4 p-3 border rounded-2xl transition-all cursor-pointer ${logCardBg}`}
                   >
-                    <div className={`relative w-20 rounded-xl overflow-hidden shrink-0 border self-start ${isDarkMode ? 'bg-slate-950 border-white/5' : 'bg-slate-100 border-slate-200'}`}>
-                      <img src={log.imageSrc} className="w-full h-auto block" alt="Log" />
-                      <LogOverlay log={log} />
+                    <div className={`relative w-20 h-20 rounded-xl overflow-hidden shrink-0 border self-start flex items-center justify-center ${isDarkMode ? 'bg-slate-950 border-white/5' : 'bg-slate-100 border-slate-200'}`}>
+                      {log.imageSrc ? (
+                        <>
+                          <img src={log.imageSrc} className="w-full h-auto block" alt="Log" />
+                          <LogOverlay log={log} />
+                        </>
+                      ) : (
+                        // Plan-stage entries have no image — show a Sparkles
+                        // glyph so the broken-image icon doesn't ship.
+                        <Sparkles className={`w-6 h-6 ${isDarkMode ? 'text-violet-400' : 'text-violet-500'}`} />
+                      )}
                     </div>
                     <div className="flex-1 min-w-0 py-1">
                       <div className="flex justify-between items-center mb-1">
