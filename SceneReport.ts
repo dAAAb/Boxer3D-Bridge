@@ -12,11 +12,34 @@ export interface SceneObject {
   confidence: number;
 }
 
+export interface CameraIntrinsics {
+  /// [fx, fy, cx, cy] in NATIVE camera pixel space — same dimensions as
+  /// `image_size_native`. Lets the browser project 3D OBBs back into the
+  /// same image Gemini saw, so 2D detections can be matched to track UUIDs
+  /// by closest-pixel distance in the canonical 0–1000 normalized space.
+  fxfycxcy: [number, number, number, number];
+  image_size_native: [number, number];
+}
+
+export interface SceneImage {
+  /// JPEG bytes, base64 (no `data:` prefix).
+  base64: string;
+  mime: string;
+  width: number;
+  height: number;
+}
+
 export interface SceneReport {
   version?: number;
   timestamp: number;
   coordinate_frame?: string;
   objects: SceneObject[];
+  /// Camera pose (4×4 column-major in `camera.pose_world`) is sent every
+  /// tick. Intrinsics are also sent every tick (cheap, 4 floats); image
+  /// is only attached when the browser explicitly requested a frame —
+  /// otherwise this stays undefined to keep regular ticks tiny.
+  camera_intrinsics?: CameraIntrinsics;
+  image?: SceneImage;
 }
 
 /// Body name convention for bridge-injected OBBs: `stream_{label}_{trackId}`.

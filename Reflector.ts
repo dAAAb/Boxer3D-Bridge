@@ -68,12 +68,17 @@ export class Reflector extends THREE.Mesh {
             type: THREE.HalfFloatType 
         });
 
-        (this as unknown as ReflectorMesh).material = new THREE.MeshPhysicalMaterial({
-            map: blendTexture,
+        // Only set `map` when a texture is actually provided. Passing
+        // `map: undefined` triggers a THREE.Material warning even though
+        // it's effectively a no-op — the demo's plane is reflection-only,
+        // never gets a blend texture.
+        const matOptions: THREE.MeshPhysicalMaterialParameters = {
             color,
-            roughness: 0.5, 
-            metalness: 0.1, 
-        });
+            roughness: 0.5,
+            metalness: 0.1,
+        };
+        if (blendTexture) matOptions.map = blendTexture;
+        (this as unknown as ReflectorMesh).material = new THREE.MeshPhysicalMaterial(matOptions);
 
         (this as unknown as ReflectorMesh).material.onBeforeCompile = (shader) => {
             shader.uniforms.tDiffuse = { value: this.renderTarget.texture };

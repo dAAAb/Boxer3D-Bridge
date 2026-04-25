@@ -73,8 +73,12 @@ export class MujocoSim {
         this.selectionManager = new SelectionManager(this.renderSys.scene, this.renderSys.renderer, this.renderSys.camera, container);
         
         this.ikSys = new IkSystem(this.mujoco, this.renderSys.camera, this.renderSys.renderer.domElement, this.renderSys.controls);
-        this.renderSys.simGroup.add(this.ikSys.target); 
-        this.renderSys.scene.add(this.ikSys.control as unknown as THREE.Object3D);
+        this.renderSys.simGroup.add(this.ikSys.target);
+        // three.js ≥ r169 split TransformControls into a Controls subclass +
+        // a separate visual helper. `.getHelper()` returns the addable
+        // Object3D — adding the controls instance directly triggered the
+        // 'object not an instance of THREE.Object3D' console error.
+        this.renderSys.scene.add(this.ikSys.control.getHelper());
         
         this.sequenceAnimator = new SequenceAnimator();
         
