@@ -12,7 +12,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { MujocoSim } from './MujocoSim';
 import { SceneObject, SceneReport, streamBodyName } from './SceneReport';
 import { SceneReportClient } from './SceneReportClient';
-import { RobotFunctionCall, expandPlan } from './actionLibrary';
+import { RobotFunctionCall, expandPlan, predictPlanFinalPositions } from './actionLibrary';
 import { planActions } from './geminiPlan';
 import { mujocoToArkit, worldToGemini1000 } from './projection';
 import { RobotSelector } from './components/RobotSelector';
@@ -340,6 +340,7 @@ export function App() {
     setPipelineError(null);
     setPipelinePlan([]);
     pipelineRunning.current = false;
+    simRef.current?.renderSys.clearPlanPreview();
   };
 
   /// Direct-pickup path: bypass Gemini and target a specific tracked body
@@ -495,6 +496,30 @@ export function App() {
       }
       setDetectedCount(detectedTargets.current.length);
     }
+
+    // Tesla-FSD-style ghost overlay: translucent boxes at each cube's
+    // predicted final position + arrows from current → predicted. Lets
+    // the user SEE what the plan intends to do before pressing Execute,
+    // and (during Execute) see real cubes catch up to ghosts. Cleared
+    // on Execute completion / new Detect / reset.
+    if (simRef.current && scene.objects.length > 0) {
+      const predictions = predictPlanFinalPositions(result.calls, lookupTrackPos);
+      const items: { trackId: string; currentPos: THREE.Vector3; finalPos: THREE.Vector3; size: [number, number, number]; label?: string }[] = [];
+      for (const [trackId, finalPos] of predictions) {
+        const obj = scene.objects.find((o) => o.id === trackId);
+        if (!obj) continue;
+        const currentPos = lookupTrackPos(trackId);
+        if (!currentPos) continue;
+        items.push({
+          trackId,
+          currentPos,
+          finalPos,
+          size: obj.size_m,
+          label: obj.label,
+        });
+      }
+      simRef.current.renderSys.setPlanPreview(items);
+    }
     // Append a planning-stage entry to the API Call History so user can
     // see the structured plan even when they cascaded through Execute.
     const logId = uuidv4();
@@ -530,6 +555,9 @@ export function App() {
       simRef.current!.executePlan(expansion.steps, () => resolve());
     });
     setIsPickingUp(false);
+    // Clear the Tesla ghost overlay — real cubes now occupy where the
+    // ghosts were, no need to keep the comparison overlay around.
+    simRef.current.renderSys.clearPlanPreview();
   };
 
   // Stage 1 of the pipeline. Always runs the full cinematic VLM flow
@@ -570,6 +598,8 @@ export function App() {
   const detectImpl = async (prompt: string, type: DetectType, temperature: number, enableThinking: boolean, modelId: string) => {
       if (!simRef.current) return;
       simRef.current.renderSys.clearErMarkers();
+      // Re-running Detect invalidates any prior plan preview — wipe.
+      simRef.current.renderSys.clearPlanPreview();
       detectedTargets.current = [];
       setDetectedCount(0);
       setIsPickingUp(false);
