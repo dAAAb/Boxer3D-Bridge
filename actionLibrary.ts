@@ -73,11 +73,54 @@ chains. Do not output explanations.
 
 /// 20 cm above target — enough clearance for most tabletop objects.
 const HOVER_HEIGHT = 0.20;
-/// Z offset above object centre when descending to grasp. Conservative —
-/// wraps gripper around the upper portion of the object body.
+/// Z offset above object centre when descending to top-grasp. Conservative
+/// — wraps gripper around the upper portion of the object body.
 const GRASP_Z_OFFSET = 0.02;
+/// Margin under the OBB top edge when top-edge-grasping a flat object —
+/// fingers need to be slightly below the top to wrap around.
+const TOP_EDGE_MARGIN = 0.005;
 /// Default gripper-pointing-down quaternion.
 const downQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI, 0, 0));
+
+// ─── Per-label grasp policy (Step 3.6) ──────────────────────────────
+//
+// `pick` expansion looks up the policy by label and chooses where the
+// TCP descends + which orientation it uses. Without this every grasp
+// would be top-down to the OBB centre, which works for cups/bottles but
+// stabs the keyboard on flat objects whose centre sits near the table.
+
+type GraspPolicy =
+  | 'top_grasp'        // descend to OBB centre, gripper-down. Default.
+  | 'top_edge_grasp';  // descend to OBB top edge, gripper-down. For flat-
+                       // ish objects (open laptop, book) where the
+                       // graspable feature is the upper rim.
+
+const LABEL_POLICY: Record<string, GraspPolicy> = {
+  cup:      'top_grasp',
+  bottle:   'top_grasp',
+  can:      'top_grasp',
+  glass:    'top_grasp',
+  laptop:   'top_edge_grasp',
+  keyboard: 'top_edge_grasp',
+  book:     'top_edge_grasp',
+  plate:    'top_edge_grasp',
+};
+
+/// Compute the descent Z (world-frame) for the TCP based on label policy.
+/// Returns a Z value relative to the OBB centre, NOT the floor.
+function descendZ(centerZ: number, halfHeight: number, policy: GraspPolicy): number {
+  switch (policy) {
+    case 'top_edge_grasp':
+      // TCP at (centre + halfH - margin) → fingers wrap around the OBB
+      // top rim. For an open laptop (size_z ~21 cm) the top is ~20 cm
+      // above floor, plenty of clearance for the ~5 cm fingers.
+      return centerZ + halfHeight - TOP_EDGE_MARGIN;
+    case 'top_grasp':
+    default:
+      // TCP slightly above centre → fingers wrap around upper body.
+      return centerZ + GRASP_Z_OFFSET;
+  }
+}
 
 /// Resolves a track UUID to a current world position. Caller (App.tsx)
 /// wires this to MujocoSim.getStreamBodyPosition so we always grasp where
@@ -109,8 +152,12 @@ export function expandPlan(
           warnings.push(`pick: track_id "${id}" not in current sim. Skipping.`);
           continue;
         }
-        const above = pos.clone(); above.z += HOVER_HEIGHT;
-        const grasp = pos.clone(); grasp.z += GRASP_Z_OFFSET;
+        const obj = scene.objects.find((o) => o.id === id);
+        const policy: GraspPolicy = obj ? (LABEL_POLICY[obj.label] ?? 'top_grasp') : 'top_grasp';
+        const halfH = (obj?.size_m[2] ?? 0) / 2;
+        const graspZ = descendZ(pos.z, halfH, policy);
+        const grasp = new THREE.Vector3(pos.x, pos.y, graspZ);
+        const above = new THREE.Vector3(pos.x, pos.y, graspZ + HOVER_HEIGHT);
         steps.push(
           { kind: 'move_to_pose',  pos: above, quat: downQuat.clone(), duration_s: 2.0 },
           { kind: 'open_gripper',   duration_s: 0.5 },
