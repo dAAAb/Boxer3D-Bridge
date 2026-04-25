@@ -6,6 +6,7 @@
 
 import * as THREE from 'three';
 import { IkSystem } from './IkSystem';
+import type { PrimitiveStep } from './actionLibrary';
 import { MujocoData, MujocoModel } from './types';
 
 /**
@@ -48,6 +49,20 @@ export class SequenceAnimator {
     private onPickupComplete?: (id: number) => void;
     // Callback to notify app when the entire sequence is finished
     private onFinished?: () => void;
+
+    // ─── Parallel API: executeActions (Step 3.5) ──────────────────────
+    //
+    // The original Pickup pipeline (start + the 14-step state machine in
+    // prepareStep) is preserved verbatim above. Below is an alternate
+    // "action mode" where the animator just plays a flat queue of
+    // PrimitiveSteps (move_to_pose / open_gripper / close_gripper / wait).
+    // Mode is selected via `useActionMode` and `update()` branches on it.
+    private useActionMode = false;
+    private actionQueue: PrimitiveStep[] = [];
+    private actionIdx = 0;
+    /// Fallback gripper value for steps that don't change the gripper —
+    /// keeps the previous open/close state instead of resetting to 0.
+    private currentGripperVal = 0;
 
     constructor() {
         this.names = ["Move over Cube", "Hover", "Open", "Lower", "Wait", "Grasp", "Wait", "Lift", "Move to Tray", "Lower", "Wait", "Release", "Wait", "Lift", "Return Home"];
@@ -110,6 +125,96 @@ export class SequenceAnimator {
 
     stop() {
         this.running = false;
+        this.useActionMode = false;
+        this.actionQueue = [];
+        this.actionIdx = 0;
+    }
+
+    /// Step-3.5 entry point: hand the animator a flat queue of primitive
+    /// steps (built by `actionLibrary.expandPlan`) and let it play them in
+    /// order. Independent of the cube-pickup state machine — just IK +
+    /// joint interpolation under the hood, but the target sequence comes
+    /// from outside instead of the hardcoded 14-state machine.
+    executeActions(
+        steps: PrimitiveStep[],
+        ikTarget: THREE.Object3D,
+        mjData: MujocoData,
+        ikSystem: IkSystem,
+        onFinished?: () => void,
+    ) {
+        if (steps.length === 0) {
+            onFinished?.();
+            return;
+        }
+        this.onFinished = onFinished;
+        this.onPickupComplete = undefined;
+        this.useActionMode = true;
+        this.actionQueue = steps;
+        this.actionIdx = 0;
+        this.running = true;
+        this.prepareActionStep(ikTarget, mjData, ikSystem);
+    }
+
+    private prepareActionStep(
+        ikTarget: THREE.Object3D,
+        mjData: MujocoData,
+        ikSystem: IkSystem,
+    ) {
+        if (this.actionIdx >= this.actionQueue.length) {
+            // Done. Send TCP back to a neutral hover so the next action
+            // sequence starts from a sane pose; mirrors the Pickup
+            // sequence's "Return Home" final step.
+            this.running = false;
+            this.useActionMode = false;
+            this.actionQueue = [];
+            this.actionIdx = 0;
+            this.onFinished?.();
+            this.onFinished = undefined;
+            return;
+        }
+
+        const step = this.actionQueue[this.actionIdx];
+
+        this.startPos.copy(ikTarget.position);
+        this.startQuat.copy(ikTarget.quaternion);
+        this.timer = 0;
+        this.startJoints = [];
+        for (let i = 0; i < 7; i++) this.startJoints.push(mjData.qpos[i]);
+
+        // Default: hold pose, hold gripper. Each step kind below overrides
+        // what's relevant.
+        this.targetPos.copy(this.startPos);
+        this.targetQuat.copy(this.startQuat);
+
+        switch (step.kind) {
+            case 'move_to_pose':
+                this.targetPos.copy(step.pos);
+                if (step.quat) this.targetQuat.copy(step.quat);
+                this.duration = step.duration_s;
+                break;
+            case 'open_gripper':
+                this.currentGripperVal = 255;
+                this.duration = step.duration_s ?? 0.5;
+                break;
+            case 'close_gripper':
+                this.currentGripperVal = 0;
+                this.duration = step.duration_s ?? 0.5;
+                break;
+            case 'wait':
+                this.duration = step.duration_s;
+                break;
+        }
+        this.gripperVal = this.currentGripperVal;
+
+        // Solve IK only when the pose actually changes — saves a solve on
+        // gripper / wait steps (they keep the same target).
+        if (step.kind === 'move_to_pose') {
+            const sol = ikSystem.solve(this.targetPos, this.targetQuat, this.startJoints);
+            this.targetJoints = sol ?? [...this.startJoints];
+            if (!sol) console.warn(`[executeActions] IK failed at action step ${this.actionIdx}`);
+        } else {
+            this.targetJoints = [...this.startJoints];
+        }
     }
 
     // Full reset (e.g. when simulation resets)
@@ -119,6 +224,10 @@ export class SequenceAnimator {
         this.curCubeIdx = 0;
         this.droppedCount = 0;
         this.gripperVal = 0;
+        this.useActionMode = false;
+        this.actionQueue = [];
+        this.actionIdx = 0;
+        this.currentGripperVal = 0;
     }
 
     // Called every frame to smoothly move the joints towards destination
@@ -169,9 +278,14 @@ export class SequenceAnimator {
         if (gripperId !== -1) mjData.ctrl[gripperId] = this.gripperVal;
         
         // If step finished, move to next
-        if (p >= 1.0) { 
-            this.step++; 
-            this.prepareStep(ikTarget, mjData, ikSystem); 
+        if (p >= 1.0) {
+            if (this.useActionMode) {
+                this.actionIdx++;
+                this.prepareActionStep(ikTarget, mjData, ikSystem);
+            } else {
+                this.step++;
+                this.prepareStep(ikTarget, mjData, ikSystem);
+            }
         }
     }
 
