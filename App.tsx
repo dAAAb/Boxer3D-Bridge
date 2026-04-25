@@ -415,29 +415,33 @@ export function App() {
   ) => {
     if (pipelineRunning.current) return;
     pipelineRunning.current = true;
+    // Fresh-state reset on every press: pressing any stage button always
+    // triggers a complete cascade rerun. Without this, after a successful
+    // full run the chips read 'done' and the if-checks below skip every
+    // stage, so subsequent presses appear to do nothing — what the user
+    // saw as "stuck on Detecting...".
+    setPipelineStatus({ detect: 'pending', plan: 'pending', execute: 'pending' });
     setPipelineError(null);
+    setPipelinePlan([]);
+    simRef.current?.renderSys.clearPlanPreview();
 
     try {
       // ── Stage 1 — Detect ──
-      if (pipelineStatus.detect !== 'done') {
-        setPipelineStatus((s) => ({ ...s, detect: 'running' }));
-        await runDetectStage(prompt, type, temperature, enableThinking, modelId);
-        setPipelineStatus((s) => ({ ...s, detect: 'done' }));
-      }
+      setPipelineStatus((s) => ({ ...s, detect: 'running' }));
+      await runDetectStage(prompt, type, temperature, enableThinking, modelId);
+      setPipelineStatus((s) => ({ ...s, detect: 'done' }));
       if (stopAt === 'detect') return;
 
       // ── Stage 2 — Plan ──
-      if (pipelineStatus.plan !== 'done') {
-        setPipelineStatus((s) => ({ ...s, plan: 'running' }));
-        const calls = await runPlanStage(prompt, temperature, enableThinking, modelId);
-        setPipelinePlan(calls);
-        setPipelineStatus((s) => ({ ...s, plan: 'done' }));
-      }
+      setPipelineStatus((s) => ({ ...s, plan: 'running' }));
+      const calls = await runPlanStage(prompt, temperature, enableThinking, modelId);
+      setPipelinePlan(calls);
+      setPipelineStatus((s) => ({ ...s, plan: 'done' }));
       if (stopAt === 'plan') return;
 
       // ── Stage 3 — Execute ──
       setPipelineStatus((s) => ({ ...s, execute: 'running' }));
-      await runExecuteStage();
+      await runExecuteStage(calls);
       setPipelineStatus((s) => ({ ...s, execute: 'done' }));
     } catch (err) {
       const msg = (err as Error).message ?? String(err);
@@ -502,6 +506,7 @@ export function App() {
     // the user SEE what the plan intends to do before pressing Execute,
     // and (during Execute) see real cubes catch up to ghosts. Cleared
     // on Execute completion / new Detect / reset.
+    let previewSnapshot = '';
     if (simRef.current && scene.objects.length > 0) {
       const predictions = predictPlanFinalPositions(result.calls, lookupTrackPos);
       const items: { trackId: string; currentPos: THREE.Vector3; finalPos: THREE.Vector3; size: [number, number, number]; label?: string }[] = [];
@@ -519,6 +524,19 @@ export function App() {
         });
       }
       simRef.current.renderSys.setPlanPreview(items);
+      // Capture a "future" snapshot of the canvas with the ghost overlay
+      // painted in — used as the Plan log's thumbnail so the user can
+      // eyeball the predicted end-state at a glance instead of getting a
+      // generic Sparkles glyph. Wait two RAFs so the next render-loop
+      // tick has actually drawn the previewGroup into the framebuffer.
+      if (items.length > 0) {
+        await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+        try {
+          previewSnapshot = simRef.current.renderSys.getCanvasSnapshot(320, 320, 'image/jpeg');
+        } catch (err) {
+          console.warn('[plan] snapshot failed:', err);
+        }
+      }
     }
     // Append a planning-stage entry to the API Call History so user can
     // see the structured plan even when they cascaded through Execute.
@@ -527,7 +545,7 @@ export function App() {
       {
         id: logId,
         timestamp: new Date(),
-        imageSrc: '',
+        imageSrc: previewSnapshot,
         prompt: task,
         fullPrompt: '[Plan stage]',
         type: 'Points' as DetectType,
@@ -539,17 +557,28 @@ export function App() {
     return result.calls;
   };
 
-  const runExecuteStage = async (): Promise<void> => {
+  const runExecuteStage = async (calls: RobotFunctionCall[]): Promise<void> => {
     const scene = lastDetectScene.current;
     if (!scene) throw new Error('Execute: no scene available');
     if (!simRef.current) throw new Error('Execute: sim not ready');
-    const expansion = expandPlan(pipelinePlan, lookupTrackPos, scene);
+    const expansion = expandPlan(calls, lookupTrackPos, scene);
     if (expansion.warnings.length > 0) {
       console.warn('[execute] expansion warnings:', expansion.warnings);
     }
     if (expansion.steps.length === 0) {
       throw new Error('Execute: plan expanded to zero primitives. ' + expansion.warnings.join('; '));
     }
+    // Append a return-home primitive at the end of every plan. Without
+    // this the arm stays parked above the last release pose, occluding
+    // future top-down Detect snapshots and (via stale IK / gizmo state)
+    // making subsequent pipeline runs feel sluggish.
+    const homeQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI, 0, 0));
+    expansion.steps.push({
+      kind: 'move_to_pose',
+      pos: new THREE.Vector3(0, 0, 0.45),
+      quat: homeQuat,
+      duration_s: 1.5,
+    });
     setIsPickingUp(true);
     await new Promise<void>((resolve) => {
       simRef.current!.executePlan(expansion.steps, () => resolve());
