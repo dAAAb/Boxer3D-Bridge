@@ -12,6 +12,7 @@ import { RobotLoader } from './RobotLoader';
 import { SceneReport, STREAM_BODY_REGEX, computeStreamPoses, streamBodyName } from './SceneReport';
 import { SelectionManager } from './SelectionManager';
 import { SequenceAnimator } from './SequenceAnimator';
+import type { PrimitiveStep } from './actionLibrary';
 import { MujocoData, MujocoModel, MujocoModule } from './types';
 import { getName } from './utils/StringUtils';
 
@@ -444,6 +445,25 @@ export class MujocoSim {
     /// to nudge the user to press Radio.
     getStreamBodyKeys(): Set<string> {
         return new Set(this.streamBodyMap.keys());
+    }
+
+    /// Step-3.5 entry point: hand the SequenceAnimator a flat queue of
+    /// primitive action steps and run them in order. Mirrors pickupItems
+    /// for the action-plan flow.
+    executePlan(steps: PrimitiveStep[], onFinished?: () => void) {
+        if (!this.mjData) {
+            onFinished?.();
+            return;
+        }
+        this.ikSys.syncToSite(this.mjData);
+        this.sequenceAnimator.executeActions(
+            steps,
+            this.ikSys.target,
+            this.mjData,
+            this.ikSys,
+            onFinished,
+        );
+        this.setIkEnabled(false);
     }
 
     /// Look up the current world position of a stream-injected body by its
