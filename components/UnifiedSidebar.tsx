@@ -3,15 +3,76 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import { BoxSelect, ChevronDown, FastForward, Grab, History, Info, Loader2, MousePointer2, RotateCcw, Scan, Send, Settings2, Thermometer, X } from 'lucide-react';
+import { AlertCircle, BoxSelect, Check, ChevronDown, FastForward, Grab, History, Info, Loader2, MousePointer2, Play, RotateCcw, Scan, Send, Settings2, Sparkles, Thermometer, X } from 'lucide-react';
 import { useState } from 'react';
 import { LogOverlay } from '../App';
+import { RobotFunctionCall } from '../actionLibrary';
 import { DetectedItem, DetectType, LogEntry } from '../types';
+
+type PipelineStatus = 'pending' | 'running' | 'done' | 'failed';
+interface PipelineState {
+  detect: PipelineStatus;
+  plan: PipelineStatus;
+  execute: PipelineStatus;
+}
+
+type PipelineCb = (prompt: string, type: DetectType, temperature: number, enableThinking: boolean, modelId: string) => void;
+
+function StatusGlyph({ s }: { s: PipelineStatus }) {
+  if (s === 'done') return <Check className="w-3 h-3" />;
+  if (s === 'running') return <Loader2 className="w-3 h-3 animate-spin" />;
+  if (s === 'failed') return <AlertCircle className="w-3 h-3" />;
+  return <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50" />;
+}
+
+function PipelineChipRow({
+  status,
+  isDarkMode,
+  onReset,
+}: {
+  status: PipelineState;
+  isDarkMode: boolean;
+  onReset?: () => void;
+}) {
+  const stageColor = (s: PipelineStatus) => {
+    if (s === 'done')    return isDarkMode ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' : 'bg-emerald-50 text-emerald-700 border-emerald-200';
+    if (s === 'running') return isDarkMode ? 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'    : 'bg-indigo-50 text-indigo-700 border-indigo-200';
+    if (s === 'failed')  return isDarkMode ? 'bg-red-500/15 text-red-300 border-red-500/30'           : 'bg-red-50 text-red-700 border-red-200';
+    return isDarkMode ? 'bg-slate-800/40 text-slate-500 border-white/5' : 'bg-slate-100/60 text-slate-400 border-slate-200';
+  };
+  const anyDone = status.detect === 'done' || status.plan === 'done' || status.execute === 'done';
+  return (
+    <div className="flex items-center gap-1 px-1">
+      {(['detect', 'plan', 'execute'] as const).map((stage, i) => (
+        <div key={stage} className="flex items-center gap-1">
+          <div className={`flex items-center gap-1.5 px-2 py-1 rounded-lg border text-[9px] font-bold uppercase tracking-widest ${stageColor(status[stage])}`}>
+            <StatusGlyph s={status[stage]} />
+            <span>{stage}</span>
+          </div>
+          {i < 2 && <span className={`text-[8px] ${isDarkMode ? 'text-slate-600' : 'text-slate-300'}`}>›</span>}
+        </div>
+      ))}
+      {anyDone && onReset && (
+        <button
+          onClick={onReset}
+          title="Reset pipeline state"
+          className={`ml-auto p-1 rounded text-[9px] ${isDarkMode ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-slate-600'}`}
+        >
+          <RotateCcw className="w-3 h-3" />
+        </button>
+      )}
+    </div>
+  );
+}
 
 interface UnifiedSidebarProps {
   isOpen: boolean;
   onClose: () => void;
-  onSend: (prompt: string, type: DetectType, temperature: number, enableThinking: boolean, modelId: string) => void;
+  /// Step-3.5 B+ pipeline: any of these can be pressed at any time; the
+  /// app-side runPipeline auto-cascades any prerequisite stage.
+  onDetect: PipelineCb;
+  onPlan: PipelineCb;
+  onExecute: PipelineCb;
   onPickup: () => void;
   isLoading: boolean;
   hasDetectedItems: boolean;
@@ -23,6 +84,10 @@ interface UnifiedSidebarProps {
   streamLabels?: string[];
   streamObjects?: { label: string; id: string }[];
   onDirectPick?: (label: string, trackId: string) => void;
+  pipelineStatus?: PipelineState;
+  pipelineError?: string | null;
+  pipelinePlan?: RobotFunctionCall[];
+  onPipelineReset?: () => void;
 }
 
 /**
@@ -32,7 +97,9 @@ interface UnifiedSidebarProps {
 export function UnifiedSidebar({
   isOpen,
   onClose,
-  onSend,
+  onDetect,
+  onPlan,
+  onExecute,
   onPickup,
   isLoading,
   hasDetectedItems,
@@ -44,6 +111,10 @@ export function UnifiedSidebar({
   streamLabels = [],
   streamObjects = [],
   onDirectPick,
+  pipelineStatus = { detect: 'pending', plan: 'pending', execute: 'pending' },
+  pipelineError = null,
+  pipelinePlan = [],
+  onPipelineReset,
 }: UnifiedSidebarProps) {
   const [prompt, setPrompt] = useState('red cubes');
   const [type, setType] = useState<DetectType>('Segmentation masks');
@@ -236,53 +307,114 @@ export function UnifiedSidebar({
             </div>
           )}
           
-          <div className="flex gap-3">
-            <button 
-                onClick={() => onSend(prompt, type, temperature, enableThinking, modelId)}
-                disabled={isLoading || !prompt.trim() || isInvalidConfig}
-                title="Detect: Trigger Gemini analysis of current workspace"
-                className={`flex-1 py-4 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${
-                  isLoading || isInvalidConfig 
-                    ? 'bg-slate-200 text-slate-400 cursor-not-allowed dark:bg-slate-800 dark:text-slate-600' 
-                    : 'bg-slate-900 text-white hover:bg-black shadow-lg active:scale-[0.98] dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white'
-                }`}
-            >
-                {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-                {isLoading ? 'Detecting' : 'Detect'}
-            </button>
+          {/* Pipeline status chips — one per stage, ✓ done / ⟳ running / • pending. */}
+          <PipelineChipRow status={pipelineStatus} isDarkMode={isDarkMode} onReset={onPipelineReset} />
 
-            <button 
-                onClick={() => {
-                  onPickup();
-                  // Check if mobile (width < 660px matches standard md breakpoint) and close sidebar
-                  if (window.innerWidth < 660) {
-                    onClose();
-                  }
-                }}
-                disabled={(!hasDetectedItems && !isPickingUp) || isLoading}
-                title={isPickingUp ? `Click to increase simulation speed (Current: ${playbackSpeed}x)` : "Start pickup sequence for detected items"}
-                className={`flex-1 py-4 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 transition-all shadow-xl active:scale-[0.98] ${
-                  (!hasDetectedItems && !isPickingUp) || isLoading 
-                    ? (isDarkMode ? 'bg-slate-800 text-slate-600 cursor-not-allowed shadow-none' : 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none')
-                    : (isPickingUp 
-                        ? (isDarkMode ? 'bg-emerald-500 hover:bg-emerald-600 text-white shadow-emerald-500/10' : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-100')
-                        : (isDarkMode ? 'bg-indigo-500 hover:bg-indigo-600 text-white shadow-indigo-500/10' : 'bg-indigo-600 hover:bg-indigo-700 text-white shadow-indigo-100')
-                      )
-                }`}
+          {/* Plan preview — shown after Plan stage completes. Lets user
+              eyeball the action sequence before pressing Execute (the B
+              "human-in-loop" flow), and also visible after a cascaded
+              Execute as a record of what just happened. */}
+          {pipelinePlan.length > 0 && (
+            <div className={`p-3 rounded-2xl border text-[11px] leading-relaxed space-y-1 ${
+              isDarkMode ? 'bg-indigo-500/5 border-indigo-500/20 text-slate-300' : 'bg-indigo-50/40 border-indigo-200/60 text-slate-700'
+            }`}>
+              <div className="flex items-center gap-1.5 mb-1.5">
+                <Sparkles className="w-3 h-3 text-indigo-500" />
+                <span className="text-[9px] font-bold uppercase tracking-widest text-indigo-500">Action plan ({pipelinePlan.length} steps)</span>
+              </div>
+              <ol className="space-y-0.5 list-decimal list-inside font-mono text-[10px]">
+                {pipelinePlan.map((c, i) => (
+                  <li key={i}>
+                    <span className="font-bold">{c.function}</span>
+                    {c.args && Object.keys(c.args).length > 0 && (
+                      <span className="text-slate-500"> {JSON.stringify(c.args)}</span>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+
+          {/* Pipeline failure banner. Auto-clears after a few seconds via the parent. */}
+          {pipelineError && (
+            <div className={`flex items-start gap-2 p-3 rounded-2xl border text-[11px] ${
+              isDarkMode ? 'bg-red-500/10 border-red-500/30 text-red-300' : 'bg-red-50 border-red-200 text-red-700'
+            }`}>
+              <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+              <span className="flex-1 break-words">{pipelineError}</span>
+            </div>
+          )}
+
+          {/* Three-button cascade row. Each button independently triggers a
+              pipeline stage; runPipeline auto-runs prerequisites. */}
+          <div className="flex gap-2">
+            <button
+              onClick={() => onDetect(prompt, type, temperature, enableThinking, modelId)}
+              disabled={isLoading || !prompt.trim() || isInvalidConfig}
+              title="Stage 1: Find target objects via Gemini-ER on the iPhone RGB."
+              className={`flex-1 py-3 rounded-2xl font-bold text-xs flex items-center justify-center gap-1.5 transition-all ${
+                isLoading || isInvalidConfig
+                  ? 'bg-slate-200 text-slate-400 cursor-not-allowed dark:bg-slate-800 dark:text-slate-600'
+                  : 'bg-slate-900 text-white hover:bg-black shadow-lg active:scale-[0.98] dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white'
+              }`}
             >
-                {isPickingUp ? (
-                  <>
-                    <FastForward className="w-4 h-4" /> 
-                    <span>Fast Forward {playbackSpeed > 1 ? `(${playbackSpeed}x)` : ''}</span>
-                  </>
-                ) : (
-                  <>
-                    <Grab className="w-4 h-4" /> 
-                    <span>Pickup</span>
-                  </>
-                )}
+              {pipelineStatus.detect === 'running' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+              <span>Detect</span>
+            </button>
+            <button
+              onClick={() => onPlan(prompt, type, temperature, enableThinking, modelId)}
+              disabled={isLoading || !prompt.trim()}
+              title="Stage 2: Ask Gemini for a JSON action sequence. Auto-runs Detect first if not done."
+              className={`flex-1 py-3 rounded-2xl font-bold text-xs flex items-center justify-center gap-1.5 transition-all ${
+                isLoading
+                  ? 'bg-slate-200 text-slate-400 cursor-not-allowed dark:bg-slate-800 dark:text-slate-600'
+                  : (isDarkMode ? 'bg-violet-500 hover:bg-violet-600 text-white shadow-lg' : 'bg-violet-600 hover:bg-violet-700 text-white shadow-lg')
+              }`}
+            >
+              {pipelineStatus.plan === 'running' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+              <span>Plan</span>
+            </button>
+            <button
+              onClick={() => {
+                onExecute(prompt, type, temperature, enableThinking, modelId);
+                if (window.innerWidth < 660) onClose();
+              }}
+              disabled={isLoading || !prompt.trim()}
+              title="Stage 3: Run the planned action sequence on the sim arm. Auto-runs Detect + Plan first if not done."
+              className={`flex-1 py-3 rounded-2xl font-bold text-xs flex items-center justify-center gap-1.5 transition-all shadow-xl active:scale-[0.98] ${
+                isLoading
+                  ? (isDarkMode ? 'bg-slate-800 text-slate-600 cursor-not-allowed shadow-none' : 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none')
+                  : (isPickingUp
+                      ? (isDarkMode ? 'bg-emerald-500 text-white' : 'bg-emerald-600 text-white')
+                      : (isDarkMode ? 'bg-indigo-500 hover:bg-indigo-600 text-white' : 'bg-indigo-600 hover:bg-indigo-700 text-white'))
+              }`}
+            >
+              {pipelineStatus.execute === 'running' || isPickingUp
+                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                : <Play className="w-3.5 h-3.5" />}
+              <span>Execute</span>
             </button>
           </div>
+
+          {/* Legacy quick-pickup: drives the original 14-step pickup-to-tray
+              state machine using the markers from Detect. Useful when you
+              just want "grab the cup and drop it in the tray" without
+              going through the LLM planner. */}
+          {hasDetectedItems && !isLoading && (
+            <button
+              onClick={() => {
+                onPickup();
+                if (window.innerWidth < 660) onClose();
+              }}
+              title={isPickingUp ? `Fast-forward (current ${playbackSpeed}x)` : 'Quick pickup to tray (skips LLM planning)'}
+              className={`w-full py-2 rounded-xl font-bold text-[10px] flex items-center justify-center gap-1.5 transition-all opacity-70 hover:opacity-100 ${
+                isDarkMode ? 'bg-white/5 text-slate-400 hover:bg-white/10' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+              }`}
+            >
+              {isPickingUp ? <FastForward className="w-3 h-3" /> : <Grab className="w-3 h-3" />}
+              <span>{isPickingUp ? `Fast Forward${playbackSpeed > 1 ? ` (${playbackSpeed}x)` : ''}` : 'Quick pickup → tray (legacy)'}</span>
+            </button>
+          )}
         </section>
 
         {/* History / Logs Section */}
@@ -335,10 +467,10 @@ export function UnifiedSidebar({
                                <Info className="w-3 h-3 text-red-400/80 hover:text-red-500 cursor-help" />
                              </div>
                            </div>
-                           <button 
+                           <button
                              onClick={(e) => {
                                e.stopPropagation();
-                               onSend(log.prompt, log.type as DetectType, temperature, enableThinking, modelId);
+                               onDetect(log.prompt, log.type as DetectType, temperature, enableThinking, modelId);
                              }}
                              className={`shrink-0 flex items-center gap-1 px-2 py-1 rounded-lg text-[9px] font-bold transition-all ${
                                isDarkMode 

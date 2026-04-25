@@ -12,6 +12,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { MujocoSim } from './MujocoSim';
 import { SceneObject, SceneReport, streamBodyName } from './SceneReport';
 import { SceneReportClient } from './SceneReportClient';
+import { RobotFunctionCall, expandPlan } from './actionLibrary';
+import { planActions } from './geminiPlan';
 import { mujocoToArkit, worldToGemini1000 } from './projection';
 import { RobotSelector } from './components/RobotSelector';
 import { Toolbar } from './components/Toolbar';
@@ -125,6 +127,26 @@ export function App() {
   /// respawned track since the last Radio sync. Surfaced as a pulsing
   /// amber dot on the toolbar nudging the user to re-sync.
   const [streamStale, setStreamStale] = useState(false);
+
+  // ─── Step 3.5 pipeline state ──────────────────────────────────────
+  // 3 user-facing stages: Detect (locate) → Plan (LLM action sequence)
+  // → Execute (run on sim arm). The B+ UX is: pressing any later
+  // stage's button auto-cascades all prerequisite stages first. Status
+  // chips show ✓ done / ⟳ in-progress / • pending. Failure at any
+  // stage resets the whole pipeline to Idle and surfaces the error.
+  type PipelineStage = 'detect' | 'plan' | 'execute';
+  type PipelineStatus = 'pending' | 'running' | 'done' | 'failed';
+  const [pipelineStatus, setPipelineStatus] = useState<Record<PipelineStage, PipelineStatus>>({
+    detect: 'pending',
+    plan: 'pending',
+    execute: 'pending',
+  });
+  const [pipelineError, setPipelineError] = useState<string | null>(null);
+  const [pipelinePlan, setPipelinePlan] = useState<RobotFunctionCall[]>([]);
+  const pipelineRunning = useRef(false);
+  // The SceneReport that was used by the most recent Detect — Stage 2
+  // looks up track positions in its `objects[]` to expand the plan.
+  const lastDetectScene = useRef<SceneReport | null>(null);
 
   // Deriving activeLog directly from the latest logs state ensures UI reactivity
   const activeLog = expandedLogId ? logs.find(l => l.id === expandedLogId) : null;
@@ -295,6 +317,15 @@ export function App() {
     }
   };
 
+  /// Reset all pipeline chips to Idle. Used at the top of every fresh
+  /// pipeline run AND on failure to give the user a clean slate.
+  const resetPipeline = () => {
+    setPipelineStatus({ detect: 'pending', plan: 'pending', execute: 'pending' });
+    setPipelineError(null);
+    setPipelinePlan([]);
+    pipelineRunning.current = false;
+  };
+
   /// Direct-pickup path: bypass Gemini and target a specific tracked body
   /// by its Boxer3D UUID. Cleaner than routing a unique instance through a
   /// VLM that can't distinguish identical-looking meshes.
@@ -332,9 +363,153 @@ export function App() {
     return () => window.removeEventListener('click', handleClick);
   }, [isLoading, erLoading]);
 
-  const handleErSend = async (prompt: string, type: DetectType, temperature: number, enableThinking: boolean, modelId: string) => {
-      if (!simRef.current || erLoading) return;
-      setErLoading(true);
+  /// Returns the SceneReport that was active during the last Detect — used
+  /// by Plan stage to expand high-level RobotFunctionCalls into primitive
+  /// steps with current track positions.
+  const lookupTrackPos = (trackId: string): THREE.Vector3 | null => {
+    const scene = lastDetectScene.current;
+    if (!scene) return null;
+    const obj = scene.objects.find((o) => o.id === trackId);
+    if (!obj) return null;
+    return simRef.current?.getStreamBodyPosition(obj.label, trackId) ?? null;
+  };
+
+  /// B+ pipeline: each stage is independently runnable and auto-cascades
+  /// any prerequisite stages. Pressing Detect runs only Detect; pressing
+  /// Plan runs Detect (if pending) then Plan; pressing Execute runs all
+  /// three. State is stored in pipelineStatus so the chips reflect
+  /// progress; a failure at any stage resets the whole pipeline to Idle
+  /// and surfaces the error message.
+  const runPipeline = async (
+    stopAt: PipelineStage,
+    prompt: string,
+    type: DetectType,
+    temperature: number,
+    enableThinking: boolean,
+    modelId: string,
+  ) => {
+    if (pipelineRunning.current) return;
+    pipelineRunning.current = true;
+    setPipelineError(null);
+
+    try {
+      // ── Stage 1 — Detect ──
+      if (pipelineStatus.detect !== 'done') {
+        setPipelineStatus((s) => ({ ...s, detect: 'running' }));
+        await runDetectStage(prompt, type, temperature, enableThinking, modelId);
+        setPipelineStatus((s) => ({ ...s, detect: 'done' }));
+      }
+      if (stopAt === 'detect') return;
+
+      // ── Stage 2 — Plan ──
+      if (pipelineStatus.plan !== 'done') {
+        setPipelineStatus((s) => ({ ...s, plan: 'running' }));
+        const calls = await runPlanStage(prompt, temperature, enableThinking, modelId);
+        setPipelinePlan(calls);
+        setPipelineStatus((s) => ({ ...s, plan: 'done' }));
+      }
+      if (stopAt === 'plan') return;
+
+      // ── Stage 3 — Execute ──
+      setPipelineStatus((s) => ({ ...s, execute: 'running' }));
+      await runExecuteStage();
+      setPipelineStatus((s) => ({ ...s, execute: 'done' }));
+    } catch (err) {
+      const msg = (err as Error).message ?? String(err);
+      console.error('[pipeline] failed:', err);
+      setPipelineError(msg);
+      // Mark whichever stage was running as failed; reset the rest.
+      setPipelineStatus((s) => ({
+        detect:  s.detect  === 'running' ? 'failed' : s.detect,
+        plan:    s.plan    === 'running' ? 'failed' : s.plan,
+        execute: s.execute === 'running' ? 'failed' : s.execute,
+      }));
+      // Auto-clear chips after a moment so the next run starts clean.
+      window.setTimeout(() => resetPipeline(), 4000);
+    } finally {
+      pipelineRunning.current = false;
+    }
+  };
+
+  const runPlanStage = async (
+    task: string,
+    temperature: number,
+    enableThinking: boolean,
+    modelId: string,
+  ): Promise<RobotFunctionCall[]> => {
+    const scene = lastDetectScene.current;
+    if (!scene) throw new Error('Plan: no scene from Detect stage');
+    const apiKey = process.env.API_KEY ?? '';
+    const result = await planActions(apiKey, modelId, task, scene.objects, {
+      temperature,
+      thinking: enableThinking,
+    });
+    if (result.calls.length === 0) {
+      throw new Error(
+        `Plan: Gemini returned no actionable calls. ${result.warnings.join('; ') || result.rawText.slice(0, 200)}`,
+      );
+    }
+    // Append a planning-stage entry to the API Call History so user can
+    // see the structured plan even when they cascaded through Execute.
+    const logId = uuidv4();
+    setLogs((prev) => [
+      {
+        id: logId,
+        timestamp: new Date(),
+        imageSrc: '',
+        prompt: task,
+        fullPrompt: '[Plan stage]',
+        type: 'Points' as DetectType,
+        result: result.calls as unknown as DetectedItem[],
+        requestData: { stage: 'plan', warnings: result.warnings },
+      },
+      ...prev,
+    ]);
+    return result.calls;
+  };
+
+  const runExecuteStage = async (): Promise<void> => {
+    const scene = lastDetectScene.current;
+    if (!scene) throw new Error('Execute: no scene available');
+    if (!simRef.current) throw new Error('Execute: sim not ready');
+    const expansion = expandPlan(pipelinePlan, lookupTrackPos, scene);
+    if (expansion.warnings.length > 0) {
+      console.warn('[execute] expansion warnings:', expansion.warnings);
+    }
+    if (expansion.steps.length === 0) {
+      throw new Error('Execute: plan expanded to zero primitives. ' + expansion.warnings.join('; '));
+    }
+    setIsPickingUp(true);
+    await new Promise<void>((resolve) => {
+      simRef.current!.executePlan(expansion.steps, () => resolve());
+    });
+    setIsPickingUp(false);
+  };
+
+  // Renamed: the original "send to Gemini for detection" flow is now
+  // Stage 1 of the pipeline. Pulled out as `runDetectStage` so
+  // runPipeline can compose it. Behaviour is byte-identical to the old
+  // handleErSend except it (a) doesn't manage erLoading itself —
+  // pipelineRunning covers that — and (b) stashes the SceneReport into
+  // lastDetectScene so Plan can use it.
+  const runDetectStage = async (
+    prompt: string,
+    type: DetectType,
+    temperature: number,
+    enableThinking: boolean,
+    modelId: string,
+  ): Promise<void> => {
+    if (!simRef.current) throw new Error('Detect: sim not ready');
+    setErLoading(true);
+    try {
+      await detectImpl(prompt, type, temperature, enableThinking, modelId);
+    } finally {
+      setErLoading(false);
+    }
+  };
+
+  const detectImpl = async (prompt: string, type: DetectType, temperature: number, enableThinking: boolean, modelId: string) => {
+      if (!simRef.current) return;
       simRef.current.renderSys.clearErMarkers();
       detectedTargets.current = [];
       setDetectedCount(0);
@@ -355,6 +530,10 @@ export function App() {
           }
       }
       const useIphoneImage = frameReport?.image != null;
+      // Stash for Plan / Execute stages — they need this scene's track
+      // UUIDs and positions, NOT a re-fetched live one (which may have
+      // a different track set if BoxerNet's MOT churned).
+      lastDetectScene.current = frameReport ?? lastDetectScene.current;
 
       let imageBase64: string;
       let base64Data: string;
@@ -663,9 +842,17 @@ export function App() {
           <UnifiedSidebar
             isOpen={showSidebar}
             onClose={() => setShowSidebar(false)}
-            onSend={handleErSend}
+            onDetect={(prompt, type, temperature, enableThinking, modelId) =>
+              runPipeline('detect', prompt, type, temperature, enableThinking, modelId)
+            }
+            onPlan={(prompt, type, temperature, enableThinking, modelId) =>
+              runPipeline('plan', prompt, type, temperature, enableThinking, modelId)
+            }
+            onExecute={(prompt, type, temperature, enableThinking, modelId) =>
+              runPipeline('execute', prompt, type, temperature, enableThinking, modelId)
+            }
             onPickup={handlePickup}
-            isLoading={erLoading}
+            isLoading={erLoading || pipelineRunning.current}
             hasDetectedItems={detectedCount > 0}
             logs={logs}
             onOpenLog={(log) => setExpandedLogId(log.id)}
@@ -675,6 +862,10 @@ export function App() {
             streamLabels={streamLabels}
             streamObjects={streamObjects}
             onDirectPick={handleDirectPick}
+            pipelineStatus={pipelineStatus}
+            pipelineError={pipelineError}
+            pipelinePlan={pipelinePlan}
+            onPipelineReset={resetPipeline}
           />
 
           {/* Expanded View Modal - Overlay everything */}
