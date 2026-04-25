@@ -512,14 +512,16 @@ export function App() {
 
   // Stage 1 of the pipeline. Two execution paths:
   //
-  //  (a) iPhone stream connected → existing Gemini-on-real-RGB flow via
-  //      detectImpl (request iPhone frame, send to Gemini, project-match
-  //      detections to track UUIDs, place markers).
-  //  (b) No stream → synthesise the SceneReport directly from current
-  //      MuJoCo bodies. No VLM perception needed: we already know every
-  //      cube's exact world position from the sim. Lets the user run
-  //      Plan/Execute against the default 20-cube scene before ever
-  //      pressing Radio.
+  //  (a) Stream bodies present in sim → existing Gemini-on-real-RGB flow
+  //      via detectImpl (request iPhone frame, send to Gemini,
+  //      project-match detections to track UUIDs, place markers).
+  //  (b) No stream bodies → synthesise the SceneReport directly from
+  //      current MuJoCo bodies. No VLM perception needed: we already
+  //      know every cube's exact world position from the sim. Lets the
+  //      user run Plan/Execute against the default 20-cube scene before
+  //      ever pressing Radio, and avoids a 30+ s VLM detour when bridge
+  //      is up but no real iPhone is publishing (fake_publisher / no
+  //      Radio yet).
   const runDetectStage = async (
     prompt: string,
     type: DetectType,
@@ -529,13 +531,18 @@ export function App() {
   ): Promise<void> => {
     if (!simRef.current) throw new Error('Detect: sim not ready');
 
-    // Path (b): no stream → synthesise from sim, skip Gemini entirely.
-    // Cheaper, faster, and Gemini can't add useful info anyway because
-    // every cube is identical-looking and the planner just needs labels.
-    if (!streamConnected || !sceneClientRef.current) {
+    // Path discriminator: do any stream bodies exist in the sim? If not,
+    // there's nothing the VLM can usefully detect for us — Gemini would
+    // just see synthetic white meshes and the JPEG round-trip is wasted.
+    // hasStreamBodies replaces the older streamConnected check, which
+    // was wrong: bridge can be 'connected' (browser ↔ relay) yet no
+    // iPhone publishing, no useful image to send.
+    const hasStreamBodies = (simRef.current.getStreamBodyKeys().size ?? 0) > 0;
+
+    if (!hasStreamBodies) {
       const synthetic = simRef.current.synthesizeSceneFromBodies();
       if (!synthetic || synthetic.objects.length === 0) {
-        throw new Error('Detect: no iPhone stream and no synthesisable bodies in sim');
+        throw new Error('Detect: no stream bodies and no synthesisable bodies in sim');
       }
       lastDetectScene.current = synthetic;
       return;
