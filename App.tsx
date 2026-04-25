@@ -387,7 +387,15 @@ export function App() {
     if (!scene) return null;
     const obj = scene.objects.find((o) => o.id === trackId);
     if (!obj) return null;
-    return simRef.current?.getStreamBodyPosition(obj.label, trackId) ?? null;
+    // Try stream lookup first (works when track_id is a UUID and a
+    // stream body was injected). Fall back to direct body-name lookup
+    // for synthetic scenes built from MuJoCo bodies (track_id IS the
+    // body name there, e.g. "cube0").
+    return (
+      simRef.current?.getStreamBodyPosition(obj.label, trackId) ??
+      simRef.current?.getBodyPositionByName(trackId) ??
+      null
+    );
   };
 
   /// B+ pipeline: each stage is independently runnable and auto-cascades
@@ -502,12 +510,16 @@ export function App() {
     setIsPickingUp(false);
   };
 
-  // Renamed: the original "send to Gemini for detection" flow is now
-  // Stage 1 of the pipeline. Pulled out as `runDetectStage` so
-  // runPipeline can compose it. Behaviour is byte-identical to the old
-  // handleErSend except it (a) doesn't manage erLoading itself —
-  // pipelineRunning covers that — and (b) stashes the SceneReport into
-  // lastDetectScene so Plan can use it.
+  // Stage 1 of the pipeline. Two execution paths:
+  //
+  //  (a) iPhone stream connected → existing Gemini-on-real-RGB flow via
+  //      detectImpl (request iPhone frame, send to Gemini, project-match
+  //      detections to track UUIDs, place markers).
+  //  (b) No stream → synthesise the SceneReport directly from current
+  //      MuJoCo bodies. No VLM perception needed: we already know every
+  //      cube's exact world position from the sim. Lets the user run
+  //      Plan/Execute against the default 20-cube scene before ever
+  //      pressing Radio.
   const runDetectStage = async (
     prompt: string,
     type: DetectType,
@@ -516,6 +528,20 @@ export function App() {
     modelId: string,
   ): Promise<void> => {
     if (!simRef.current) throw new Error('Detect: sim not ready');
+
+    // Path (b): no stream → synthesise from sim, skip Gemini entirely.
+    // Cheaper, faster, and Gemini can't add useful info anyway because
+    // every cube is identical-looking and the planner just needs labels.
+    if (!streamConnected || !sceneClientRef.current) {
+      const synthetic = simRef.current.synthesizeSceneFromBodies();
+      if (!synthetic || synthetic.objects.length === 0) {
+        throw new Error('Detect: no iPhone stream and no synthesisable bodies in sim');
+      }
+      lastDetectScene.current = synthetic;
+      return;
+    }
+
+    // Path (a): full VLM detection.
     setErLoading(true);
     try {
       await detectImpl(prompt, type, temperature, enableThinking, modelId);

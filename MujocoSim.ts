@@ -438,6 +438,57 @@ export class MujocoSim {
         }
     }
 
+    /// Build a SceneReport from the current MuJoCo bodies (no iPhone stream
+    /// needed). Used when the user wants to Plan/Execute against the
+    /// default demo scene (20 random cubes) before pressing Radio. Each
+    /// cube body becomes a SceneObject with body name as track_id and a
+    /// colour-based label so Gemini can plan "find two red cubes and
+    /// stack them" without ever calling a VLM detector.
+    synthesizeSceneFromBodies(): SceneReport | null {
+        if (!this.mjModel || !this.mjData) return null;
+        // Matches the cube colour order in RobotLoader.patchSingleRobot.
+        const COLORS = ['red', 'cyan', 'green', 'yellow'];
+        const objects: { id: string; label: string; center_world: [number, number, number]; size_m: [number, number, number]; yaw_rad: number; confidence: number; }[] = [];
+        for (let i = 0; i < this.mjModel.nbody; i++) {
+            const name = getName(this.mjModel, this.mjModel.name_bodyadr[i]);
+            const m = name.match(/^cube(\d+)$/);
+            if (!m) continue;
+            const idx = parseInt(m[1], 10);
+            const px = this.mjData.xpos[i * 3];
+            const py = this.mjData.xpos[i * 3 + 1];
+            const pz = this.mjData.xpos[i * 3 + 2];
+            objects.push({
+                id: name,
+                label: `${COLORS[idx % 4]} cube`,
+                center_world: [px, py, pz],
+                size_m: [0.04, 0.04, 0.04],
+                yaw_rad: 0,
+                confidence: 1.0,
+            });
+        }
+        if (objects.length === 0) return null;
+        return {
+            version: 1,
+            coordinate_frame: 'mujoco_world',
+            timestamp: Date.now() / 1000,
+            objects,
+        };
+    }
+
+    /// Direct world-position lookup by MuJoCo body name. Stream bodies use
+    /// `stream_{label}_{UUID}` names so getStreamBodyPosition is the right
+    /// call there; this is the corresponding lookup for synthetic scenes
+    /// where track_id == body name (e.g. "cube0", "cube12").
+    getBodyPositionByName(name: string): THREE.Vector3 | null {
+        if (!this.mjModel) return null;
+        for (let i = 0; i < this.mjModel.nbody; i++) {
+            if (getName(this.mjModel, this.mjModel.name_bodyadr[i]) === name) {
+                return this.renderSys.bodies[i]?.position.clone() ?? null;
+            }
+        }
+        return null;
+    }
+
     /// Snapshot of the body names currently injected from the stream.
     /// Used by App.tsx to decide whether the "sync" toolbar dot should
     /// pulse — when the stream has track UUIDs the sim doesn't know
