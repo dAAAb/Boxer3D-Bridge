@@ -6,6 +6,7 @@
 import type { SceneReport } from './SceneReport';
 
 type Listener = (report: SceneReport) => void;
+type FrameResolver = (report: SceneReport) => void;
 
 export class SceneReportClient {
   private ws: WebSocket | null = null;
@@ -13,6 +14,13 @@ export class SceneReportClient {
   private listeners = new Set<Listener>();
   private reconnectTimer: number | null = null;
   private closed = false;
+  /// When `requestFrame()` is awaiting an image-bearing SceneReport, the
+  /// resolver sits here. The next inbound report whose `image` field is
+  /// populated fires it and clears the slot. We keep this single-slot
+  /// (no queue) because Detect is user-driven and never overlapping.
+  private pendingFrameResolve: FrameResolver | null = null;
+  private pendingFrameReject: ((reason: Error) => void) | null = null;
+  private pendingFrameTimeout: number | null = null;
   latest: SceneReport | null = null;
   connected = false;
 
@@ -54,6 +62,16 @@ export class SceneReportClient {
         const report = JSON.parse(text) as SceneReport;
         this.latest = report;
         this.listeners.forEach((l) => l(report));
+        if (report.image && this.pendingFrameResolve) {
+          const resolve = this.pendingFrameResolve;
+          this.pendingFrameResolve = null;
+          this.pendingFrameReject = null;
+          if (this.pendingFrameTimeout !== null) {
+            window.clearTimeout(this.pendingFrameTimeout);
+            this.pendingFrameTimeout = null;
+          }
+          resolve(report);
+        }
       } catch (e) {
         console.warn('[SceneReportClient] bad payload', e);
       }
@@ -76,6 +94,48 @@ export class SceneReportClient {
   onUpdate(fn: Listener) {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
+  }
+
+  /// Ask the iPhone for one fresh JPEG keyframe. Resolves with the next
+  /// inbound SceneReport whose `image` field is populated. Rejects on
+  /// timeout (default 3 s — LAN round-trip is sub-200ms, anything longer
+  /// usually means the iPhone isn't streaming or BoxerNet stalled).
+  /// Single-slot: a second call before the first resolves cancels the
+  /// first with a 'superseded' error.
+  requestFrame(timeoutMs = 3000): Promise<SceneReport> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error('WebSocket not open'));
+    }
+    if (this.pendingFrameReject) {
+      this.pendingFrameReject(new Error('superseded by newer requestFrame'));
+      this.pendingFrameResolve = null;
+      this.pendingFrameReject = null;
+      if (this.pendingFrameTimeout !== null) {
+        window.clearTimeout(this.pendingFrameTimeout);
+        this.pendingFrameTimeout = null;
+      }
+    }
+    return new Promise<SceneReport>((resolve, reject) => {
+      this.pendingFrameResolve = resolve;
+      this.pendingFrameReject = reject;
+      this.pendingFrameTimeout = window.setTimeout(() => {
+        this.pendingFrameResolve = null;
+        this.pendingFrameReject = null;
+        this.pendingFrameTimeout = null;
+        reject(new Error(`requestFrame timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+      try {
+        this.ws!.send(JSON.stringify({ type: 'request_frame' }));
+      } catch (e) {
+        if (this.pendingFrameTimeout !== null) {
+          window.clearTimeout(this.pendingFrameTimeout);
+          this.pendingFrameTimeout = null;
+        }
+        this.pendingFrameResolve = null;
+        this.pendingFrameReject = null;
+        reject(e as Error);
+      }
+    });
   }
 
   dispose() {
