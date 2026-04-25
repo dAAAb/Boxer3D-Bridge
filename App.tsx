@@ -127,6 +127,13 @@ export function App() {
   /// respawned track since the last Radio sync. Surfaced as a pulsing
   /// amber dot on the toolbar nudging the user to re-sync.
   const [streamStale, setStreamStale] = useState(false);
+  /// Prompt text lives in App.tsx (not the sidebar) so the Radio-click
+  /// handler can auto-fill it with the first detected label when the
+  /// user hasn't yet typed a custom query. Lets a fresh-launch demo
+  /// reload directly into a sensible 'cup' / 'laptop' rather than the
+  /// hardcoded 'red cubes' that has nothing to do with the user's
+  /// real-world scene.
+  const [prompt, setPrompt] = useState('red cubes');
 
   // ─── Step 3.5 pipeline state ──────────────────────────────────────
   // 3 user-facing stages: Detect (locate) → Plan (LLM action sequence)
@@ -308,6 +315,15 @@ export function App() {
       if (isMounted.current) {
         simRef.current.setIkEnabled(false);
         setIsLoading(false);
+        // Auto-fill the prompt with the first detected label only when
+        // the user hasn't typed anything custom — i.e. it's still the
+        // hardcoded 'red cubes' demo seed or empty. Once the user has
+        // typed something else we leave their text alone, even on
+        // subsequent Radio clicks.
+        const firstLabel = scene.objects[0]?.label;
+        if (firstLabel && (prompt === 'red cubes' || prompt.trim() === '')) {
+          setPrompt(firstLabel);
+        }
       }
     } catch (err: unknown) {
       if (isMounted.current) {
@@ -866,6 +882,8 @@ export function App() {
             pipelineError={pipelineError}
             pipelinePlan={pipelinePlan}
             onPipelineReset={resetPipeline}
+            prompt={prompt}
+            onPromptChange={setPrompt}
           />
 
           {/* Expanded View Modal - Overlay everything */}

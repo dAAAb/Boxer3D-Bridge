@@ -88,6 +88,8 @@ interface UnifiedSidebarProps {
   pipelineError?: string | null;
   pipelinePlan?: RobotFunctionCall[];
   onPipelineReset?: () => void;
+  prompt: string;
+  onPromptChange: (next: string) => void;
 }
 
 /**
@@ -115,8 +117,10 @@ export function UnifiedSidebar({
   pipelineError = null,
   pipelinePlan = [],
   onPipelineReset,
+  prompt,
+  onPromptChange,
 }: UnifiedSidebarProps) {
-  const [prompt, setPrompt] = useState('red cubes');
+  const setPrompt = onPromptChange;
   const [type, setType] = useState<DetectType>('Segmentation masks');
   const [temperature, setTemperature] = useState(0.1);
   const [enableThinking, setEnableThinking] = useState(true);
