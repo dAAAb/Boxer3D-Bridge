@@ -512,7 +512,15 @@ export class MujocoSim {
             this.ikSys.target,
             this.mjData,
             this.ikSys,
-            onFinished,
+            () => {
+                // Hide the IK target's gizmo + axes after the action
+                // sequence completes — otherwise the chunky Transform
+                // Controls stay parked at the last release pose and
+                // clutter the post-Execute view.
+                this.ikSys.setTargetVisible(false);
+                this.ikSys.setGizmoVisible(false);
+                onFinished?.();
+            },
         );
         this.setIkEnabled(false);
     }

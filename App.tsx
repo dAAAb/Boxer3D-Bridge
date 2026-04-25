@@ -473,6 +473,28 @@ export function App() {
         `Plan: Gemini returned no actionable calls. ${result.warnings.join('; ') || result.rawText.slice(0, 200)}`,
       );
     }
+    // Visual feedback: drop a blue ER cone on every track_id the plan
+    // references so the user can see at a glance which objects Franka
+    // is about to touch. Mirrors the cones that used to appear during
+    // VLM Detect — the semantic moves from 'what Gemini saw' to 'what
+    // the plan picked', which is more useful anyway.
+    const referenced = new Set<string>();
+    for (const call of result.calls) {
+      const args = (call as { args?: { track_id?: string } }).args;
+      if (args?.track_id) referenced.add(args.track_id);
+    }
+    if (referenced.size > 0 && simRef.current) {
+      simRef.current.renderSys.clearErMarkers();
+      detectedTargets.current = [];
+      for (const trackId of referenced) {
+        const pos = lookupTrackPos(trackId);
+        if (!pos) continue;
+        const markerId = Date.now() + Math.random();
+        simRef.current.renderSys.addErMarker(pos, trackId, markerId);
+        detectedTargets.current.push({ pos, markerId });
+      }
+      setDetectedCount(detectedTargets.current.length);
+    }
     // Append a planning-stage entry to the API Call History so user can
     // see the structured plan even when they cascaded through Execute.
     const logId = uuidv4();
