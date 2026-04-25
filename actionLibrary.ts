@@ -228,3 +228,71 @@ export function expandPlan(
   }
   return { steps, warnings };
 }
+
+// ─── Plan preview (Step 3.7 — ghost overlay) ───────────────────────────
+
+export interface PlanPreviewItem {
+  trackId: string;
+  label: string;
+  currentPos: THREE.Vector3;
+  finalPos: THREE.Vector3;
+  /// Full extents (w, h, d) — passed straight from SceneObject.size_m so
+  /// the ghost mesh matches the real OBB size.
+  size: [number, number, number];
+}
+
+/// Pure-kinematic forward simulation of a RobotFunctionCall sequence.
+/// Returns a map from track UUID to its predicted final position. State
+/// machine tracks which track (if any) is currently held by the gripper;
+/// only RELEASED tracks (place_above / place_at / open_gripper while
+/// holding) end up with a final position recorded. Used to render
+/// Tesla-FSD-style ghost overlays at the moment Plan completes.
+///
+/// No physics — just the geometry of pick-then-place. Real Execute may
+/// diverge if collisions happen, in which case the divergence is itself
+/// useful diagnostic (ghost vs reality).
+export function predictPlanFinalPositions(
+  calls: RobotFunctionCall[],
+  lookupPos: PosLookup,
+): Map<string, THREE.Vector3> {
+  const result = new Map<string, THREE.Vector3>();
+  let held: string | null = null;
+
+  const currentPosOf = (id: string): THREE.Vector3 | null => {
+    if (result.has(id)) return result.get(id)!.clone();
+    return lookupPos(id);
+  };
+
+  for (const call of calls) {
+    switch (call.function) {
+      case 'pick':
+        held = call.args.track_id;
+        // No final position written — picked cube moves with the
+        // gripper until the next place_*. If never released, we leave
+        // it out of the preview map (no ghost for in-flight cubes).
+        break;
+      case 'place_above': {
+        if (!held) break;
+        const targetPos = currentPosOf(call.args.track_id);
+        if (!targetPos) break;
+        const finalPos = targetPos.clone();
+        finalPos.z += call.args.height_m;
+        result.set(held, finalPos);
+        held = null;
+        break;
+      }
+      case 'place_at':
+        if (!held) break;
+        result.set(held, new THREE.Vector3(call.args.x, call.args.y, call.args.z));
+        held = null;
+        break;
+      case 'open_gripper':
+        held = null;
+        break;
+      // close_gripper, move_to_pose, wait — no cube state change.
+      default:
+        break;
+    }
+  }
+  return result;
+}
