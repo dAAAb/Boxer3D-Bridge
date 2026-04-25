@@ -88,8 +88,8 @@ interface UnifiedSidebarProps {
   pipelineError?: string | null;
   pipelinePlan?: RobotFunctionCall[];
   onPipelineReset?: () => void;
-  prompt: string;
-  onPromptChange: (next: string) => void;
+  prompt?: string;
+  onPromptChange?: (next: string) => void;
 }
 
 /**
@@ -117,10 +117,13 @@ export function UnifiedSidebar({
   pipelineError = null,
   pipelinePlan = [],
   onPipelineReset,
-  prompt,
+  prompt = '',
   onPromptChange,
 }: UnifiedSidebarProps) {
-  const setPrompt = onPromptChange;
+  // Defaults so that an HMR-mid-flight render where parent props haven't
+  // re-propagated yet doesn't crash with `Cannot read properties of
+  // undefined`. Real value lives in App.tsx; this is just a safety net.
+  const setPrompt = onPromptChange ?? (() => {});
   const [type, setType] = useState<DetectType>('Segmentation masks');
   const [temperature, setTemperature] = useState(0.1);
   const [enableThinking, setEnableThinking] = useState(true);
