@@ -13,20 +13,26 @@ export interface PlanResult {
   warnings: string[];
 }
 
-/// Stage-2 Gemini call. Given the user's task description and the objects
-/// currently in the sim (from the live SceneReport, with track UUIDs and
-/// world positions), ask the LLM for a JSON action sequence.
+/// Stage-2 Gemini call. Given the user's task description, the objects
+/// currently in the sim (from the live SceneReport, with track UUIDs
+/// and world positions), and OPTIONALLY the iPhone JPEG that Stage 1
+/// saw, ask the LLM for a JSON action sequence.
 ///
-/// Important: we send only the structured object list, not an image —
-/// Gemini already saw the iPhone frame in Stage 1 (Detect). Stage 2 is
-/// pure planning over symbolic state, so it's image-free, faster, and
-/// cheaper.
+/// Stage 1 and Stage 2 are independent API calls — Gemini has no memory
+/// across them. So if the user's task references visual qualifiers
+/// BoxerNet labels can't capture (colour, brand, "the dirty one"),
+/// Stage 2 needs to see the image too. Pass image when you have one;
+/// skip it when you don't (synthetic scene, sim-canvas fallback).
 export async function planActions(
   apiKey: string,
   modelId: string,
   task: string,
   objects: SceneObject[],
-  opts: { temperature?: number; thinking?: boolean } = {},
+  opts: {
+    temperature?: number;
+    thinking?: boolean;
+    image?: { mime: string; base64: string };
+  } = {},
 ): Promise<PlanResult> {
   const objectList = objects
     .map((o) => {
@@ -42,10 +48,13 @@ export async function planActions(
     'Detected objects (current scene):',
     objectList || '  (none)',
     '',
+    opts.image
+      ? 'The attached image is the iPhone RGB view of the scene above. Use it to disambiguate visual qualifiers in the task (colour, branding, position) — every object in the list has a visible counterpart in the image. Match by spatial location.'
+      : '',
     `User task: "${task}"`,
     '',
     'Output the JSON array of function calls now. No explanation, just the array.',
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const config: any = {
@@ -54,10 +63,16 @@ export async function planActions(
   };
   if (opts.thinking === false) config.thinkingConfig = { thinkingBudget: 0 };
 
+  const parts: ({ text: string } | { inlineData: { mimeType: string; data: string } })[] = [];
+  if (opts.image) {
+    parts.push({ inlineData: { mimeType: opts.image.mime, data: opts.image.base64 } });
+  }
+  parts.push({ text: prompt });
+
   const ai = new GoogleGenAI({ apiKey });
   const response = await ai.models.generateContent({
     model: modelId,
-    contents: { parts: [{ text: prompt }] },
+    contents: { parts },
     config,
   });
 

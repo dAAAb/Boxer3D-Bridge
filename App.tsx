@@ -469,9 +469,14 @@ export function App() {
     const scene = lastDetectScene.current;
     if (!scene) throw new Error('Plan: no scene from Detect stage');
     const apiKey = process.env.API_KEY ?? '';
+    // Forward the iPhone JPEG (when present) so Stage 2 can resolve
+    // visual qualifiers BoxerNet can't — colour, branding, "the bigger
+    // one". Synthetic scenes (no Radio yet) have no image; Gemini
+    // falls back to label-only reasoning over MuJoCo bodies.
     const result = await planActions(apiKey, modelId, task, scene.objects, {
       temperature,
       thinking: enableThinking,
+      image: scene.image ? { mime: scene.image.mime, base64: scene.image.base64 } : undefined,
     });
     if (result.calls.length === 0) {
       throw new Error(
