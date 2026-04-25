@@ -122,7 +122,15 @@ export class SceneReportClient {
         this.pendingFrameResolve = null;
         this.pendingFrameReject = null;
         this.pendingFrameTimeout = null;
-        reject(new Error(`requestFrame timed out after ${timeoutMs} ms`));
+        // The iPhone's WS may have entered a "open from TCP perspective
+        // but no messages flow" zombie state. Force-reconnect so the
+        // next requestFrame uses a fresh WS instead of needing the user
+        // to toggle the iOS Bridge switch by hand. The 2 s reconnect
+        // delay in scheduleReconnect gives the iOS side time to flush
+        // its own state too.
+        console.warn(`[SceneReportClient] requestFrame timed out (${timeoutMs} ms) — forcing WS reconnect`);
+        this.forceReconnect();
+        reject(new Error(`requestFrame timed out after ${timeoutMs} ms (reconnecting)`));
       }, timeoutMs);
       try {
         this.ws!.send(JSON.stringify({ type: 'request_frame' }));
@@ -146,5 +154,18 @@ export class SceneReportClient {
     }
     this.ws?.close();
     this.listeners.clear();
+  }
+
+  /// Tear down the current WebSocket immediately so the existing onclose
+  /// handler can schedule a fresh connect. Called when we detect that
+  /// the socket is in a zombie state — TCP-open but messages don't
+  /// flow — typically after a `requestFrame()` timeout. This replaces
+  /// the manual iPhone-side "toggle Stream off/on" workaround.
+  private forceReconnect() {
+    if (this.closed) return;
+    this.connected = false;
+    this.ws?.close();
+    // Don't null-out this.ws here — let the natural onclose handler do
+    // it, otherwise scheduleReconnect won't be called.
   }
 }
