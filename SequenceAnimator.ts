@@ -179,7 +179,7 @@ export class SequenceAnimator {
         this.startQuat.copy(ikTarget.quaternion);
         this.timer = 0;
         this.startJoints = [];
-        for (let i = 0; i < 7; i++) this.startJoints.push(mjData.qpos[i]);
+        for (let i = 0; i < ikSystem.armDof; i++) this.startJoints.push(mjData.qpos[i]);
 
         // Default: hold pose, hold gripper. Each step kind below overrides
         // what's relevant.
@@ -242,9 +242,11 @@ export class SequenceAnimator {
         const ease = p * p * (3 - 2 * p); 
         
         // 1. Joint Space Interpolation
-        // We interpolate the actuator commands (ctrl) directly.
-        if (this.startJoints.length === 7 && this.targetJoints.length === 7) {
-            for(let i=0; i<7; i++) {
+        // We interpolate the actuator commands (ctrl) directly. Length is
+        // armDof (6 for PiPER, 7 for Franka); both endpoints must agree.
+        const armDof = ikSystem.armDof;
+        if (this.startJoints.length === armDof && this.targetJoints.length === armDof) {
+            for (let i = 0; i < armDof; i++) {
                 mjData.ctrl[i] = this.startJoints[i] + (this.targetJoints[i] - this.startJoints[i]) * ease;
             }
         }
@@ -299,7 +301,7 @@ export class SequenceAnimator {
 
          // Capture current joints as start
          this.startJoints = [];
-         for(let i=0; i<7; i++) this.startJoints.push(mjData.qpos[i]);
+         for (let i = 0; i < ikSystem.armDof; i++) this.startJoints.push(mjData.qpos[i]);
          
          // Get current cube position
          const cPos = new THREE.Vector3();

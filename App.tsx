@@ -193,7 +193,7 @@ export function App() {
           simRef.current = new MujocoSim(containerRef.current, mujocoModuleRef.current);
           simRef.current.renderSys.setDarkMode(isDarkMode);
           
-          simRef.current.init("franka_panda_stack", "scene.xml", (msg) => {
+          simRef.current.init("agilex_piper", "scene.xml", (msg) => {
              if (isMounted.current) setLoadingStatus(msg);
           })
              .then(() => {

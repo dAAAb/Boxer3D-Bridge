@@ -118,9 +118,9 @@ export class MujocoSim {
 
             this.mujoco.mj_forward(this.mjModel, this.mjData!);
             this.renderSys.initScene(this.mjModel);
-            this.ikSys.init(this.mjModel, isDouble);
+            this.ikSys.init(this.mjModel, isDouble, this.armDofForRobot());
             this.ikSys.syncToSite(this.mjData!);
-            
+
             this.ikSys.target.quaternion.setFromEuler(new THREE.Euler(Math.PI, 0, 0));
             this.ikSys.target.position.set(0, 0, 0.45);
 
@@ -132,10 +132,20 @@ export class MujocoSim {
         }
     }
     
+    /// Returns the DoF count for the IK arm chain (6 PiPER, 7 Franka).
+    /// Caller (init / reload) passes this to ikSys.init so the solver picks
+    /// the right back-end.
+    private armDofForRobot(): number {
+        return this.currentRobotId === 'agilex_piper' ? 6 : 7;
+    }
+
     private setInitialPose() {
         if (!this.mjModel || !this.mjData) return;
-        const initVals = [1.707, -1.754, 0.003, -2.702, 0.003, 0.951, 2.490, 0.000];
-        
+        // Franka: 7 arm joints + 1 gripper = 8 ctrl. PiPER: 6 arm + 1 gripper = 7.
+        const initVals = this.currentRobotId === 'agilex_piper'
+            ? [0, 1.57, -1.3485, 0, 0, 0, 0]                              // PiPER home from keyframe
+            : [1.707, -1.754, 0.003, -2.702, 0.003, 0.951, 2.490, 0.000]; // Franka demo home
+
         for (let i = 0; i < Math.min(initVals.length, this.mjModel.nu); i++) {
             this.mjData.ctrl[i] = initVals[i];
             if (this.mjModel.actuator_trnid[2 * i + 1] === 1) {
@@ -365,7 +375,7 @@ export class MujocoSim {
         this.setInitialPose();
         this.mujoco.mj_forward(this.mjModel, this.mjData!);
         this.renderSys.initScene(this.mjModel);
-        this.ikSys.init(this.mjModel, isDouble);
+        this.ikSys.init(this.mjModel, isDouble, this.armDofForRobot());
         this.ikSys.syncToSite(this.mjData!);
 
         this.ikSys.target.quaternion.setFromEuler(new THREE.Euler(Math.PI, 0, 0));

@@ -30,9 +30,13 @@ export class RobotLoader {
 
         const isDouble = false;
         const isStacking = robotId === 'franka_panda_stack';
-        // Base URL for standard models from DeepMind's repository
+        // Base URL: Franka comes from the DeepMind menagerie GitHub raw, PiPER
+        // is bundled locally under public/robots/agilex_piper/ so we don't
+        // depend on an upstream mirror that may not exist for AgileX.
         const currentRobotId = isStacking ? 'franka_emika_panda' : robotId;
-        const baseUrl = `https://raw.githubusercontent.com/google-deepmind/mujoco_menagerie/main/${currentRobotId}/`;
+        const baseUrl = currentRobotId === 'agilex_piper'
+            ? `/robots/agilex_piper/`
+            : `https://raw.githubusercontent.com/google-deepmind/mujoco_menagerie/main/${currentRobotId}/`;
 
         const downloaded = new Set<string>(); // Keep track to avoid re-downloading same file twice
         const queue: Array<string> = []; // Queue of files to process
@@ -155,6 +159,24 @@ export class RobotLoader {
         // Ensure Panda has a named gripper actuator and a TCP site for IK
         if (fname.endsWith('panda.xml')) {
             text = text.replace(/(<body[^>]*name=["']hand["'][^>]*>)/, '$1<site name="tcp" pos="0 0 0.1" size="0.01" rgba="1 0 0 0.5" group="1"/>').replace(/name=["']actuator8["']/, 'name="gripper"');
+        }
+        // PiPER: inject TCP site at finger pivot (link7/link8 are at z=0.13503
+        // in link6 frame; placing TCP at z=0.135 means the IK target sits
+        // exactly at the finger closing axis, not 1.5 cm short). Also strip
+        // mesh-referenced collision geoms — mujoco-js WASM crashes on
+        // STL-based capsule auto-fitting; physics still runs from <inertial>
+        // tags, just with no per-link collision mesh. Both fixes lifted from
+        // colleague's PiPER reference implementation.
+        if (fname.endsWith('piper.xml')) {
+            text = text.replace(/<geom\s+[^>]*\/>/g, (match) => {
+                if (!/class="collision"/.test(match)) return match;
+                if (!/\bmesh=/.test(match)) return match;
+                return '';
+            });
+            text = text.replace(
+                /(<body[^>]*name=["']link6["'][^>]*>)/,
+                '$1<site name="tcp" pos="0 0 0.135" size="0.01" rgba="1 0 0 0.5" group="1"/>',
+            );
         }
         return text;
     }

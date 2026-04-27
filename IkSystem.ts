@@ -8,6 +8,7 @@ import * as THREE from 'three';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { calculateAnalyticalIK } from './FrankaAnalyticalIK';
+import { solveIK as solveNumericalIK, NEUTRAL_Q as PIPER_NEUTRAL_Q, IKOptions as NumericalIKOptions } from './NumericalIK';
 import { MujocoData, MujocoModel, MujocoModule } from './types';
 
 function squaredDistance(arr1: number[], arr2: number[]) {
@@ -20,31 +21,44 @@ function squaredDistance(arr1: number[], arr2: number[]) {
 
 /**
  * IkSystem
- * Handles Inverse Kinematics calculations using the analytical solver.
+ * Inverse Kinematics. Two solver back-ends gated by `armDof`:
+ *   - 7-DoF (Franka): analytical solver with q7 redundancy scan.
+ *   - 6-DoF (PiPER):  Levenberg–Marquardt numerical solver from NumericalIK.
+ * Caller (MujocoSim) passes armDof at init time based on robotId.
  */
 export class IkSystem {
     target: THREE.Group;
     control: TransformControls;
-    
+
     calculating = false;
     gripperSiteId = -1;
-    
-    private qNeutral = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]; // Preferred "home" pose
-    
-    // Joint 7 parameters for redundancy resolution
+
+    /// 6 (PiPER) or 7 (Franka). Set in init(); defaults to Franka so old
+    /// code paths don't break before the caller wires this up.
+    armDof = 7;
+    /// Cached MuJoCo refs needed by the numerical solver.
+    private mjModel: MujocoModel | null = null;
+    private mjData: MujocoData | null = null;
+    private mujoco: MujocoModule;
+
+    private qNeutralFranka = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]; // Franka "home" pose
+    private qNeutralPiper  = PIPER_NEUTRAL_Q;                          // PiPER "home" pose
+
+    // Joint 7 parameters for redundancy resolution (Franka only)
     // We scan q7 to find the global optimum closest to current/neutral
     private readonly q7Min = -2.8973;
     private readonly q7Max = 2.8973;
-    private readonly q7Step = 0.1; 
+    private readonly q7Step = 0.1;
 
     constructor(mujoco: MujocoModule, camera: THREE.Camera, domElement: HTMLElement, orbitControls: OrbitControls) {
+        this.mujoco = mujoco;
         this.target = new THREE.Group();
         this.target.name = "IK Target";
-        
+
         // Visual aid for target
         const axes = new THREE.AxesHelper(0.2);
         this.target.add(axes);
-        
+
         this.control = new TransformControls(camera, domElement);
         this.control.addEventListener('dragging-changed', (event) => {
             const e = event as unknown as { value: boolean };
@@ -52,9 +66,10 @@ export class IkSystem {
         });
         this.control.attach(this.target);
     }
-    
-    init(mjModel: MujocoModel, isDouble: boolean) {
-        // Reset internal state if needed
+
+    init(mjModel: MujocoModel, isDouble: boolean, armDof: number = 7) {
+        this.mjModel = mjModel;
+        this.armDof = armDof;
     }
     
     syncToSite(mjData: MujocoData) {
@@ -76,77 +91,73 @@ export class IkSystem {
 
     /**
      * Solves IK for a specific Cartesian pose.
-     * Returns the joint angles (array of 7 numbers) or null if no solution found.
+     * Returns the joint angles (length === armDof) or null if no solution found.
+     * 7-DoF path: Franka analytical + q7 scan. 6-DoF path: NumericalIK LM.
      */
-    solve(pos: THREE.Vector3, quat: THREE.Quaternion, currentQ: number[]): number[] | null {
-        // Construct transformation matrix
+    solve(pos: THREE.Vector3, quat: THREE.Quaternion, currentQ: number[], options?: NumericalIKOptions): number[] | null {
+        if (this.armDof === 6) {
+            if (!this.mjModel || !this.mjData || this.gripperSiteId === -1) return null;
+            return solveNumericalIK(
+                this.mujoco,
+                this.mjModel,
+                this.mjData,
+                this.gripperSiteId,
+                pos,
+                quat,
+                currentQ,
+                options,
+            );
+        }
+
+        // 7-DoF Franka analytical with q7 redundancy resolution
         this.target.position.copy(pos);
         this.target.quaternion.copy(quat);
         this.target.updateMatrixWorld();
         const transform = this.target.matrixWorld;
 
-        // --- Redundancy Resolution Strategy ---
-        // 1. Try solution with current q7 (fastest, keeps continuity)
-        // 2. If valid, refine locally.
-        // 3. If not, scan full range.
-
-        // Weights for cost function: 
-        // Minimize (Distance to Current Joints) + (Distance to Neutral Joints)
-        const alpha = 1.0; // Continuity weight
+        // Weights for cost function: minimize distance-to-current + distance-to-neutral
+        const alpha = 1.0;  // Continuity weight
         const beta = 0.05;  // Neutrality weight
 
         let bestSolution: number[] | null = null;
         let minCost = Infinity;
 
-        // Helper to check and update best
         const processCandidateQ7 = (q7: number) => {
              const solutions = calculateAnalyticalIK(transform, q7);
              for (const sol of solutions) {
                  const distCurrent = squaredDistance(sol, currentQ);
-                 const distNeutral = squaredDistance(sol, this.qNeutral);
+                 const distNeutral = squaredDistance(sol, this.qNeutralFranka);
                  const cost = alpha * distCurrent + beta * distNeutral;
-                 
-                 if (cost < minCost) {
-                     minCost = cost;
-                     bestSolution = sol;
-                 }
+                 if (cost < minCost) { minCost = cost; bestSolution = sol; }
              }
         };
 
-        // 1. Try current q7
         const currentQ7 = currentQ[6];
         processCandidateQ7(currentQ7);
 
-        // 2. If no solution or to optimize, scan nearby
-        // Simple optimization: Scan range around currentQ7
         const searchRange = 0.5;
         for (let q7 = Math.max(this.q7Min, currentQ7 - searchRange); q7 <= Math.min(this.q7Max, currentQ7 + searchRange); q7 += this.q7Step) {
             processCandidateQ7(q7);
         }
-
-        // 3. Fallback: If still no solution, scan entire range (global search)
         if (!bestSolution) {
              for (let q7 = this.q7Min; q7 <= this.q7Max; q7 += this.q7Step * 2) {
                  processCandidateQ7(q7);
              }
         }
-
         return bestSolution;
     }
-    
+
     update(mjModel: MujocoModel, mjData: MujocoData) {
         if (!this.calculating) return;
-        
-        // Prepare current state
-        const currentQ = [];
-        for(let i=0; i<7; i++) currentQ.push(mjData.qpos[i]);
+        // Cache mjData for the numerical solver path
+        this.mjData = mjData;
 
-        // Solve
+        const currentQ: number[] = [];
+        for (let i = 0; i < this.armDof; i++) currentQ.push(mjData.qpos[i]);
+
         const solution = this.solve(this.target.position, this.target.quaternion, currentQ);
-        
         if (solution) {
-            // Apply solution to control
-            for(let i=0; i<7; i++) {
+            for (let i = 0; i < this.armDof; i++) {
                 mjData.ctrl[i] = solution[i];
             }
         }
@@ -170,7 +181,7 @@ export class IkSystem {
     }
     
     isActuatorIkControlled(id: number) {
-        return id >= 0 && id < 7;
+        return id >= 0 && id < this.armDof;
     }
     
     dispose() {
