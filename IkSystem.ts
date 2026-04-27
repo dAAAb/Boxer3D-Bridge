@@ -67,8 +67,9 @@ export class IkSystem {
         this.control.attach(this.target);
     }
 
-    init(mjModel: MujocoModel, isDouble: boolean, armDof: number = 7) {
+    init(mjModel: MujocoModel, isDouble: boolean, armDof: number = 7, mjData: MujocoData | null = null) {
         this.mjModel = mjModel;
+        this.mjData = mjData;
         this.armDof = armDof;
     }
     

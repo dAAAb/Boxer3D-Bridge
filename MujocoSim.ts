@@ -118,12 +118,12 @@ export class MujocoSim {
 
             this.mujoco.mj_forward(this.mjModel, this.mjData!);
             this.renderSys.initScene(this.mjModel);
-            this.ikSys.init(this.mjModel, isDouble, this.armDofForRobot());
+            this.ikSys.init(this.mjModel, isDouble, this.armDofForRobot(), this.mjData!);
             this.ikSys.syncToSite(this.mjData!);
-
-            this.ikSys.target.quaternion.setFromEuler(new THREE.Euler(Math.PI, 0, 0));
-            this.ikSys.target.position.set(0, 0, 0.45);
-
+            // Removed hardcoded target position override (0, 0, 0.45) — that
+            // was Franka-tuned and on PiPER lands the gizmo at the elbow.
+            // syncToSite above already puts the target on the actual TCP
+            // world position, which is the right default for any robot.
             this.firstIkEnable = true;
             
             this.sequenceAnimator.init(this.mjModel, isStacking, (addr) => getName(this.mjModel!, addr));
@@ -375,11 +375,11 @@ export class MujocoSim {
         this.setInitialPose();
         this.mujoco.mj_forward(this.mjModel, this.mjData!);
         this.renderSys.initScene(this.mjModel);
-        this.ikSys.init(this.mjModel, isDouble, this.armDofForRobot());
+        this.ikSys.init(this.mjModel, isDouble, this.armDofForRobot(), this.mjData!);
         this.ikSys.syncToSite(this.mjData!);
-
-        this.ikSys.target.quaternion.setFromEuler(new THREE.Euler(Math.PI, 0, 0));
-        this.ikSys.target.position.set(0, 0, 0.45);
+        // syncToSite is the source of truth for IK target position; removed
+        // the (0, 0, 0.45) Franka override that put the gizmo at the elbow
+        // on PiPER.
         this.firstIkEnable = true;
 
         this.sequenceAnimator.init(this.mjModel, isStacking, (addr) => getName(this.mjModel!, addr));
@@ -559,27 +559,24 @@ export class MujocoSim {
         this.mujoco.mj_resetData(this.mjModel, this.mjData);
         this.setInitialPose();
         this.randomizeCubes(); 
-        this.mujoco.mj_forward(this.mjModel, this.mjData); 
+        this.mujoco.mj_forward(this.mjModel, this.mjData);
         this.ikSys.syncToSite(this.mjData);
-        
-        this.ikSys.target.quaternion.setFromEuler(new THREE.Euler(Math.PI, 0, 0));
-        this.ikSys.target.position.set(0, 0, 0.45);
+        // syncToSite is authoritative — removed the Franka-tuned (0, 0,
+        // 0.45) override that put the gizmo at PiPER's elbow.
         this.firstIkEnable = true;
     }
-    
+
     togglePause() { return this.paused = !this.paused; }
-    
+
     setIkEnabled(enabled: boolean) {
         this.userIkEnabled = enabled;
         this.syncIkState();
         if (enabled && this.mjData && !this.gizmoAnim.active && !this.sequenceAnimator.running) {
-            if (this.firstIkEnable) {
-                this.ikSys.target.quaternion.setFromEuler(new THREE.Euler(Math.PI, 0, 0));
-                this.ikSys.target.position.set(0, 0, 0.45);
-                this.firstIkEnable = false;
-            } else {
-                this.ikSys.syncToSite(this.mjData);
-            }
+            // Always sync the target to the actual TCP world position, regardless
+            // of first-enable. The old "first-enable defaults to (0,0,0.45)" path
+            // assumed Franka geometry; on PiPER it dropped the gizmo at the elbow.
+            this.ikSys.syncToSite(this.mjData);
+            this.firstIkEnable = false;
         }
     }
     
