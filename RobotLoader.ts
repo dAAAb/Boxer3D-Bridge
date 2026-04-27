@@ -160,19 +160,49 @@ export class RobotLoader {
         if (fname.endsWith('panda.xml')) {
             text = text.replace(/(<body[^>]*name=["']hand["'][^>]*>)/, '$1<site name="tcp" pos="0 0 0.1" size="0.01" rgba="1 0 0 0.5" group="1"/>').replace(/name=["']actuator8["']/, 'name="gripper"');
         }
-        // PiPER: inject TCP site at finger pivot (link7/link8 are at z=0.13503
-        // in link6 frame; placing TCP at z=0.135 means the IK target sits
-        // exactly at the finger closing axis, not 1.5 cm short). Also strip
-        // mesh-referenced collision geoms — mujoco-js WASM crashes on
-        // STL-based capsule auto-fitting; physics still runs from <inertial>
-        // tags, just with no per-link collision mesh. Both fixes lifted from
-        // colleague's PiPER reference implementation.
+        // PiPER: four patches lifted from colleague's reference at
+        // /Users/dab/Downloads/piper-coke-pickup/RobotLoader.ts:63-106.
+        // mujoco-js@0.0.7 WASM does NOT support OBJ meshes (the AgileX
+        // menagerie ships 84 OBJ files for the visual links). Without
+        // stripping them out the XML parser fails silently and downstream
+        // bodies / sites never register — that was the root cause of the
+        // gizmo-at-origin bug observed 2026-04-28: TCP site was injected
+        // but the parser never reached it because OBJ-mesh visual geoms
+        // came earlier in piper.xml and choked the loader.
         if (fname.endsWith('piper.xml')) {
+            // 1. Collect names of OBJ-backed meshes (some have explicit
+            //    name="…", some don't — fall back to filename stem).
+            const objMeshNames = new Set<string>();
+            text.replace(/<mesh\s+([^>]*)\/>/g, (full) => {
+                const fileM = /file="([^"]*\.obj)"/.exec(full);
+                if (!fileM) return full;
+                const nameM = /name="([^"]+)"/.exec(full);
+                objMeshNames.add(nameM ? nameM[1] : fileM[1].replace(/\.[^.]+$/, ''));
+                return full;
+            });
+            // 2. Remove OBJ <mesh> asset declarations.
+            text = text.replace(/<mesh[^>]*file="[^"]*\.obj"[^>]*\/>/g, '');
+            // 3. Remove visual geoms that reference an OBJ mesh. Attribute
+            //    order varies in piper.xml so we match the whole tag and
+            //    extract attrs independently.
+            text = text.replace(/<geom\s+[^>]*\/>/g, (match) => {
+                if (!/class="visual"/.test(match)) return match;
+                const mMatch = /\bmesh="([^"]+)"/.exec(match);
+                if (!mMatch) return match;
+                return objMeshNames.has(mMatch[1]) ? '' : match;
+            });
+            // 4. Remove collision geoms that reference a mesh. mujoco-js
+            //    WASM crashes on STL-based capsule auto-fitting; physics
+            //    still runs from <inertial> tags, just with no per-link
+            //    collision mesh.
             text = text.replace(/<geom\s+[^>]*\/>/g, (match) => {
                 if (!/class="collision"/.test(match)) return match;
                 if (!/\bmesh=/.test(match)) return match;
                 return '';
             });
+            // 5. Inject TCP site at the finger pivot. link7/link8 are at
+            //    pos="0 0 0.13503" in link6 frame; TCP at z=0.135 puts the
+            //    IK target at the finger closing axis.
             text = text.replace(
                 /(<body[^>]*name=["']link6["'][^>]*>)/,
                 '$1<site name="tcp" pos="0 0 0.135" size="0.01" rgba="1 0 0 0.5" group="1"/>',
