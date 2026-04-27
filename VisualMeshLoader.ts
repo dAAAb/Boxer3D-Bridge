@@ -54,14 +54,31 @@ export class VisualMeshLoader {
 
         // ── 2b. Parse <material> declarations → name → THREE color hex ───
         // PiPER's piper.xml defines a per-link palette (red_mat, gray_mat,
-        // dark_gray_mat, white_mat, ...). Without this, every visual mesh
+        // dark_gray_mat, white_mat, ...). Without this every visual mesh
         // got a single shared grey-steel default and the arm rendered
         // uniformly dark. Parse rgba="r g b a" into a 0xRRGGBB integer.
+        //
+        // Cosmetic re-map: PiPER MJCF over-paints body sections with
+        // dark_gray_mat / darker_gray_mat / black_mat (vents, screw heads,
+        // sticker decals) so the body comes out noticeably darker than the
+        // STL-rendered base / wrist (which use gray_mat). User preference
+        // is uniform medium gray matching the AGILEX product photos, so
+        // collapse the gray-spectrum materials into a single neutral.
+        // Coloured accents (red_mat, white_mat, light_blue) pass through.
+        const grayCollapse = new Set([
+            'gray_mat', 'dark_gray_mat', 'darker_gray_mat',
+            'light_gray_mat', 'light_medium_gray_mat', 'black_mat',
+        ]);
+        const NEUTRAL_GRAY = 0x969696; // gray_mat 0.59 → 150
         const materialMap = new Map<string, number>();
         doc.querySelectorAll('material').forEach((el) => {
             const name = el.getAttribute('name');
             const rgba = el.getAttribute('rgba');
             if (!name || !rgba) return;
+            if (grayCollapse.has(name)) {
+                materialMap.set(name, NEUTRAL_GRAY);
+                return;
+            }
             const parts = rgba.trim().split(/\s+/).map(Number);
             if (parts.length < 3) return;
             const r = Math.max(0, Math.min(1, parts[0]));
