@@ -14,6 +14,7 @@ import { SelectionManager } from './SelectionManager';
 import { SequenceAnimator } from './SequenceAnimator';
 import type { PrimitiveStep } from './actionLibrary';
 import { MujocoData, MujocoModel, MujocoModule } from './types';
+import { VisualMeshLoader } from './VisualMeshLoader';
 import { getName } from './utils/StringUtils';
 
 /**
@@ -120,18 +121,38 @@ export class MujocoSim {
             this.renderSys.initScene(this.mjModel);
             this.ikSys.init(this.mjModel, isDouble, this.armDofForRobot(), this.mjData!);
             this.ikSys.syncToSite(this.mjData!);
-            // Removed hardcoded target position override (0, 0, 0.45) — that
-            // was Franka-tuned and on PiPER lands the gizmo at the elbow.
-            // syncToSite above already puts the target on the actual TCP
-            // world position, which is the right default for any robot.
+            // Diagnostic: prints to console which site won the 'tcp' name
+            // search and where it ended up in world. Helps confirm the TCP
+            // patch actually landed (nsite should be ≥ 1, gripperSiteId ≥ 0,
+            // and world pos should be near where the gripper visually is).
+            const gid = this.ikSys.gripperSiteId;
+            console.log('[debug-piper] nsite=', this.mjModel.nsite, 'gripperSiteId=', gid);
+            if (gid >= 0) {
+                const x = this.mjData!.site_xpos[gid * 3];
+                const y = this.mjData!.site_xpos[gid * 3 + 1];
+                const z = this.mjData!.site_xpos[gid * 3 + 2];
+                const sname = getName(this.mjModel, this.mjModel.name_siteadr[gid]);
+                console.log('[debug-piper] site name=', sname, 'world pos=', x, y, z);
+            }
             this.firstIkEnable = true;
             
             this.sequenceAnimator.init(this.mjModel, isStacking, (addr) => getName(this.mjModel!, addr));
-            
+
+            // Late-load OBJ visual meshes that mujoco-js WASM cannot parse
+            // (PiPER's link2-link5 are 100% OBJ visuals). RobotLoader stripped
+            // them from the XML so the parser would succeed; we now overlay
+            // them on the THREE.js side and they ride along on each body's
+            // MuJoCo transform automatically. Fire-and-forget — MuJoCo + IK
+            // are already running, this is purely cosmetic.
+            if (robotId === 'agilex_piper') {
+                new VisualMeshLoader(this.renderSys, robotId).load(this.mjModel, onProgress)
+                    .catch((e) => console.warn('VisualMeshLoader error:', e));
+            }
+
             this.startLoop();
         }
     }
-    
+
     /// Returns the DoF count for the IK arm chain (6 PiPER, 7 Franka).
     /// Caller (init / reload) passes this to ikSys.init so the solver picks
     /// the right back-end.
