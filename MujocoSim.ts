@@ -51,8 +51,14 @@ export class MujocoSim {
     /// flicker when the stream is slower than the physics step.
     private latestStreamReport: SceneReport | null = null;
     
-    private userIkEnabled = false; 
+    private userIkEnabled = false;
     private firstIkEnable = true; // Track first enable to enforce default rotation
+
+    /// Home TCP world position captured at init/reload time (after
+    /// setInitialPose + mj_forward). Used by getHomeTcpPose() so plans
+    /// returning home don't hardcode a Franka-specific (0,0,0.45) target.
+    private homeTcpPos = new THREE.Vector3(0, 0, 0.45);
+    private homeTcpQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI, 0, 0));
 
     // Gizmo Interpolation State
     private gizmoAnim = {
@@ -121,19 +127,12 @@ export class MujocoSim {
             this.renderSys.initScene(this.mjModel);
             this.ikSys.init(this.mjModel, isDouble, this.armDofForRobot(), this.mjData!);
             this.ikSys.syncToSite(this.mjData!);
-            // Diagnostic: prints to console which site won the 'tcp' name
-            // search and where it ended up in world. Helps confirm the TCP
-            // patch actually landed (nsite should be ≥ 1, gripperSiteId ≥ 0,
-            // and world pos should be near where the gripper visually is).
-            const gid = this.ikSys.gripperSiteId;
-            console.log('[debug-piper] nsite=', this.mjModel.nsite, 'gripperSiteId=', gid);
-            if (gid >= 0) {
-                const x = this.mjData!.site_xpos[gid * 3];
-                const y = this.mjData!.site_xpos[gid * 3 + 1];
-                const z = this.mjData!.site_xpos[gid * 3 + 2];
-                const sname = getName(this.mjModel, this.mjModel.name_siteadr[gid]);
-                console.log('[debug-piper] site name=', sname, 'world pos=', x, y, z);
-            }
+            // Capture the home-pose TCP transform now (after setInitialPose +
+            // mj_forward), so any "return home" steps target the actual
+            // robot's neutral hover instead of a hardcoded Franka-specific
+            // (0,0,0.45). PiPER's home TCP is around (0.19, 0, 0.21).
+            this.homeTcpPos.copy(this.ikSys.target.position);
+            this.homeTcpQuat.copy(this.ikSys.target.quaternion);
             this.firstIkEnable = true;
             
             this.sequenceAnimator.init(this.mjModel, isStacking, (addr) => getName(this.mjModel!, addr));
@@ -158,6 +157,13 @@ export class MujocoSim {
     /// the right back-end.
     private armDofForRobot(): number {
         return this.currentRobotId === 'agilex_piper' ? 6 : 7;
+    }
+
+    /// World-frame home TCP captured at init/reload. Plans returning home
+    /// should use this instead of hardcoding (0, 0, 0.45) — that was Franka-
+    /// tuned and on PiPER lands outside reach / at a weird joint config.
+    getHomeTcpPose(): { pos: THREE.Vector3; quat: THREE.Quaternion } {
+        return { pos: this.homeTcpPos.clone(), quat: this.homeTcpQuat.clone() };
     }
 
     private setInitialPose() {
@@ -398,9 +404,9 @@ export class MujocoSim {
         this.renderSys.initScene(this.mjModel);
         this.ikSys.init(this.mjModel, isDouble, this.armDofForRobot(), this.mjData!);
         this.ikSys.syncToSite(this.mjData!);
-        // syncToSite is the source of truth for IK target position; removed
-        // the (0, 0, 0.45) Franka override that put the gizmo at the elbow
-        // on PiPER.
+        // Re-capture home TCP after reload — robot may have changed.
+        this.homeTcpPos.copy(this.ikSys.target.position);
+        this.homeTcpQuat.copy(this.ikSys.target.quaternion);
         this.firstIkEnable = true;
 
         this.sequenceAnimator.init(this.mjModel, isStacking, (addr) => getName(this.mjModel!, addr));
@@ -582,8 +588,9 @@ export class MujocoSim {
         this.randomizeCubes(); 
         this.mujoco.mj_forward(this.mjModel, this.mjData);
         this.ikSys.syncToSite(this.mjData);
-        // syncToSite is authoritative — removed the Franka-tuned (0, 0,
-        // 0.45) override that put the gizmo at PiPER's elbow.
+        // Refresh home TCP cache after reset (qpos was reset to setInitialPose).
+        this.homeTcpPos.copy(this.ikSys.target.position);
+        this.homeTcpQuat.copy(this.ikSys.target.quaternion);
         this.firstIkEnable = true;
     }
 

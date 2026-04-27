@@ -573,15 +573,16 @@ export function App() {
     if (expansion.steps.length === 0) {
       throw new Error('Execute: plan expanded to zero primitives. ' + expansion.warnings.join('; '));
     }
-    // Append a return-home primitive at the end of every plan. Without
-    // this the arm stays parked above the last release pose, occluding
-    // future top-down Detect snapshots and (via stale IK / gizmo state)
-    // making subsequent pipeline runs feel sluggish.
-    const homeQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI, 0, 0));
+    // Append a return-home primitive at the end of every plan. Use the
+    // robot's actual home TCP (captured at init from MuJoCo FK) instead
+    // of the previous hardcoded (0, 0, 0.45) Franka literal — that
+    // landed outside PiPER's reach and produced weird IK solutions on
+    // the way back.
+    const home = simRef.current.getHomeTcpPose();
     expansion.steps.push({
       kind: 'move_to_pose',
-      pos: new THREE.Vector3(0, 0, 0.45),
-      quat: homeQuat,
+      pos: home.pos,
+      quat: home.quat,
       duration_s: 1.5,
     });
     setIsPickingUp(true);
