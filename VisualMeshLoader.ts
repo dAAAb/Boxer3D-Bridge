@@ -52,6 +52,25 @@ export class VisualMeshLoader {
         const compiler = doc.querySelector('compiler');
         const meshdir   = compiler?.getAttribute('meshdir') ?? '';
 
+        // ── 2b. Parse <material> declarations → name → THREE color hex ───
+        // PiPER's piper.xml defines a per-link palette (red_mat, gray_mat,
+        // dark_gray_mat, white_mat, ...). Without this, every visual mesh
+        // got a single shared grey-steel default and the arm rendered
+        // uniformly dark. Parse rgba="r g b a" into a 0xRRGGBB integer.
+        const materialMap = new Map<string, number>();
+        doc.querySelectorAll('material').forEach((el) => {
+            const name = el.getAttribute('name');
+            const rgba = el.getAttribute('rgba');
+            if (!name || !rgba) return;
+            const parts = rgba.trim().split(/\s+/).map(Number);
+            if (parts.length < 3) return;
+            const r = Math.max(0, Math.min(1, parts[0]));
+            const g = Math.max(0, Math.min(1, parts[1]));
+            const b = Math.max(0, Math.min(1, parts[2]));
+            const hex = (Math.round(r * 255) << 16) | (Math.round(g * 255) << 8) | Math.round(b * 255);
+            materialMap.set(name, hex);
+        });
+
         // ── 3. Build meshName → resolved file path map (OBJ only) ────────────
         // piper.xml declares meshes WITHOUT a name= attribute, e.g. <mesh file="link2_0.obj"/>
         // MuJoCo infers the name from the filename minus extension in that case.
@@ -80,6 +99,7 @@ export class VisualMeshLoader {
         interface GeomEntry {
             bodyName: string;
             meshName: string;
+            materialName: string | null;
             pos:  [number, number, number];
             quat: [number, number, number, number]; // MuJoCo [w, x, y, z]
         }
@@ -102,6 +122,7 @@ export class VisualMeshLoader {
                         geomEntries.push({
                             bodyName,
                             meshName,
+                            materialName: child.getAttribute('material'),
                             pos:  [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0],
                             quat: q.length >= 4
                                 ? [q[0], q[1], q[2], q[3]]
@@ -126,12 +147,29 @@ export class VisualMeshLoader {
         const objLoader = new OBJLoader();
         const cache     = new Map<string, THREE.Group>();
 
-        // Shared grey-steel material for all PiPER links
-        const mat = new THREE.MeshStandardMaterial({
-            color:     0xa0a8b0,
-            roughness: 0.5,
-            metalness: 0.35,
+        // Per-material cache (one MeshStandardMaterial per unique XML
+        // material name). Falls back to a shared steel-grey when the
+        // geom has no `material=` attribute or the name isn't declared.
+        const materialCache = new Map<string, THREE.MeshStandardMaterial>();
+        const fallbackMat = new THREE.MeshStandardMaterial({
+            color: 0xa0a8b0, roughness: 0.5, metalness: 0.35,
         });
+        const getMat = (name: string | null): THREE.MeshStandardMaterial => {
+            if (!name) return fallbackMat;
+            const cached = materialCache.get(name);
+            if (cached) return cached;
+            const hex = materialMap.get(name);
+            if (hex === undefined) return fallbackMat;
+            const m = new THREE.MeshStandardMaterial({
+                color: hex,
+                // Reds/whites/blacks all look fine with a mild metallic
+                // (the original PiPER renders have a satin finish).
+                roughness: 0.45,
+                metalness: 0.3,
+            });
+            materialCache.set(name, m);
+            return m;
+        };
 
         for (const entry of geomEntries) {
             const bodyId = bodyNameToId.get(entry.bodyName);
@@ -142,7 +180,9 @@ export class VisualMeshLoader {
 
             const filePath = meshFileMap.get(entry.meshName)!;
 
-            // Load once, cache by path
+            // Load once, cache by path. Material is applied per-clone
+            // below (because two geoms may reuse the same OBJ file but
+            // need different materials, e.g. red vs gray plates on link2).
             if (!cache.has(filePath)) {
                 try {
                     const r = await fetch(this.baseUrl + filePath);
@@ -153,13 +193,6 @@ export class VisualMeshLoader {
                     }
                     const objText = await r.text();
                     const parsed  = objLoader.parse(objText);
-                    parsed.traverse(c => {
-                        if ((c as THREE.Mesh).isMesh) {
-                            (c as THREE.Mesh).material = mat;
-                            c.castShadow    = true;
-                            c.receiveShadow = true;
-                        }
-                    });
                     cache.set(filePath, parsed);
                     if (onProgress) onProgress(`OBJ loaded: ${filePath}`);
                 } catch (e) {
@@ -171,6 +204,16 @@ export class VisualMeshLoader {
 
             const src   = cache.get(filePath)!;
             const clone = src.clone(true);
+
+            // Apply per-geom material (looked up by the XML material name).
+            const mat = getMat(entry.materialName);
+            clone.traverse((c) => {
+                if ((c as THREE.Mesh).isMesh) {
+                    (c as THREE.Mesh).material = mat;
+                    c.castShadow = true;
+                    c.receiveShadow = true;
+                }
+            });
 
             // Apply the geom-local offset declared in MJCF (usually zero for PiPER)
             clone.position.set(...entry.pos);
