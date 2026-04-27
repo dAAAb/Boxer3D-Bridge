@@ -73,7 +73,7 @@ export class RobotLoader {
             // If it's an XML, we might need to patch it and scan it for more dependencies
             if (fname.endsWith('.xml')) {
                 let text = await res.text();
-                text = this.patchSingleRobot(fname, sceneFile, isStacking, text, sceneReport);
+                text = this.patchSingleRobot(fname, sceneFile, isStacking, text, sceneReport, robotId);
                 
                 // Write text file to virtual FS
                 this.mujoco.FS.writeFile(`/working/${fname}`, text);
@@ -89,7 +89,7 @@ export class RobotLoader {
     }
 
     // Modifies the standard XMLs to add our specific demo objects (cubes, trays)
-    private patchSingleRobot(fname: string, sceneFile: string, isStacking: boolean, text: string, sceneReport?: SceneReport): string {
+    private patchSingleRobot(fname: string, sceneFile: string, isStacking: boolean, text: string, sceneReport?: SceneReport, robotId?: string): string {
         if (fname === sceneFile) {
             let injection = '';
             if (sceneReport && sceneReport.objects.length > 0) {
@@ -149,6 +149,23 @@ export class RobotLoader {
                 }
                 // Increased stack_base size from 0.05 to 0.1 (2x width/length) - now 20cm x 20cm tray
                 injection += `<body name="stack_base" pos="0.6 0 0.0"><geom type="box" size="0.1 0.1 0.005" rgba="0.3 0.3 0.3 1"/></body>`;
+            } else if (robotId === 'agilex_piper') {
+                // PiPER reach is ~50-60 cm, so the Franka workspace
+                // (0.6, 0) is borderline. Pack three cubes in a tighter
+                // arc and shift the tray closer to the base. Multiple
+                // RED cubes deliberately so the canonical "stack red
+                // cubes" demo prompt has at least two referents and
+                // Gemini stops returning [] per planner rule 5.
+                const cubeStyle = 'mass="0.05" friction="2 0.3 0.1" solref="0.01 1" solimp="0.95 0.99 0.001 0.5 2" condim="4"';
+                injection = `
+<body name="cube0" pos="0.30 -0.12 0.04"><freejoint/><geom type="box" size="0.02 0.02 0.02" rgba="1 0 0 1" ${cubeStyle}/></body>
+<body name="cube1" pos="0.32  0.10 0.04"><freejoint/><geom type="box" size="0.02 0.02 0.02" rgba="1 0 0 1" ${cubeStyle}/></body>
+<body name="cube2" pos="0.42  0.00 0.04"><freejoint/><geom type="box" size="0.02 0.02 0.02" rgba="0.0 0.8 0.8 1" ${cubeStyle}/></body>
+<body name="tray" pos="0.30 0.30 0.0">
+  <geom type="box" size="0.10 0.10 0.005" pos="0 0 0.005" rgba="0.8 0.8 0.8 1"/>
+  <geom type="box" size="0.10 0.005 0.02" pos="0  0.10 0.02" rgba="0.8 0.8 0.8 1"/>
+  <geom type="box" size="0.005 0.10 0.02" pos="-0.10 0 0.02" rgba="0.8 0.8 0.8 1"/>
+</body>`;
             } else {
                  // Inject single cube and tray
                  // Tray size doubled from 0.08 to 0.16. Walls adjusted accordingly.
