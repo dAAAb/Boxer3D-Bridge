@@ -461,9 +461,13 @@ export class MujocoSim {
         const objects: { id: string; label: string; center_world: [number, number, number]; size_m: [number, number, number]; yaw_rad: number; confidence: number; }[] = [];
         for (let i = 0; i < this.mjModel.nbody; i++) {
             const name = getName(this.mjModel, this.mjModel.name_bodyadr[i]);
-            const m = name.match(/^cube(\d+)$/);
+            // Match both "cube0" / "cube12" (stacking demo) and the singular
+            // "cube" (single-object demo). Without the bare-cube branch the
+            // PiPER default scene synthesises an empty SceneReport, so Plan
+            // stage fails with "no scene from Detect stage".
+            const m = name.match(/^cube(\d*)$/);
             if (!m) continue;
-            const idx = parseInt(m[1], 10);
+            const idx = m[1] === '' ? 0 : parseInt(m[1], 10);
             const px = this.mjData.xpos[i * 3];
             const py = this.mjData.xpos[i * 3 + 1];
             const pz = this.mjData.xpos[i * 3 + 2];
