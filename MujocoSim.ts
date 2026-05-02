@@ -11,11 +11,34 @@ import { RenderSystem } from './RenderSystem';
 import { RobotLoader } from './RobotLoader';
 import { SceneReport, STREAM_BODY_REGEX, computeStreamPoses, streamBodyName } from './SceneReport';
 import { SelectionManager } from './SelectionManager';
-import { SequenceAnimator } from './SequenceAnimator';
+import { SequenceAnimator, ExpectFailure, ExpectFailureReason, ExpectVerifier } from './SequenceAnimator';
 import type { PrimitiveStep } from './actionLibrary';
 import { MujocoData, MujocoModel, MujocoModule } from './types';
 import { VisualMeshLoader } from './VisualMeshLoader';
 import { getName } from './utils/StringUtils';
+
+/// Map an [r, g, b] triplet (0-1) to a coarse color name. Used to label
+/// synthesised cube objects so Gemini's symbolic scene list matches what
+/// the user actually sees. Order matters: most-saturated buckets first.
+function colorNameFromRgb(rgb: [number, number, number]): string {
+    const [r, g, b] = rgb;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    if (max - min < 0.15) {
+        if (max < 0.25) return 'black';
+        if (max > 0.85) return 'white';
+        return 'gray';
+    }
+    if (r > 0.6 && g < 0.4 && b < 0.4) return 'red';
+    if (g > 0.6 && r < 0.5 && b < 0.5) return 'green';
+    if (b > 0.6 && r < 0.5 && g < 0.5) return 'blue';
+    if (r > 0.6 && g > 0.6 && b < 0.4) return 'yellow';
+    if (g > 0.5 && b > 0.5 && r < 0.5) return 'cyan';
+    if (r > 0.6 && b > 0.6 && g < 0.5) return 'magenta';
+    if (r > 0.6 && g > 0.4 && b < 0.4) return 'orange';
+    if (r > 0.4 && g < 0.3 && b > 0.3) return 'purple';
+    return 'colored';
+}
 
 /**
  * MujocoSim: The Central Orchestrator.
@@ -429,6 +452,16 @@ export class MujocoSim {
             this.renderSys.attachStreamMeshes(streamEntries);
         }
 
+        // Re-attach OBJ visual overlays after reload — initScene above
+        // wiped renderSys.bodies and rebuilt them from STL geoms only,
+        // which on PiPER means link2-5 are empty Group()s with nothing
+        // visible. Without this the arm goes transparent every time the
+        // user presses Radio.
+        if (this.currentRobotId === 'agilex_piper') {
+            new VisualMeshLoader(this.renderSys, this.currentRobotId).load(this.mjModel, onProgress)
+                .catch((e) => console.warn('VisualMeshLoader reload error:', e));
+        }
+
         this.startLoop();
     }
 
@@ -475,6 +508,32 @@ export class MujocoSim {
         }
     }
 
+    /// Find the first geom belonging to the given body and return its
+    /// rgba (falling back to mat_rgba via geom_matid if geom_rgba is the
+    /// MuJoCo "use material" sentinel of [0.5,0.5,0.5,1]). Returns null
+    /// when no geom is found.
+    private geomRgbaForBody(bodyId: number): [number, number, number] | null {
+        const m = this.mjModel;
+        if (!m) return null;
+        for (let g = 0; g < m.ngeom; g++) {
+            if (m.geom_bodyid[g] !== bodyId) continue;
+            const r = m.geom_rgba[g * 4 + 0];
+            const gC = m.geom_rgba[g * 4 + 1];
+            const b = m.geom_rgba[g * 4 + 2];
+            const matId = m.geom_matid[g];
+            const isSentinel = matId >= 0 && r === 0.5 && gC === 0.5 && b === 0.5;
+            if (isSentinel) {
+                return [
+                    m.mat_rgba[matId * 4 + 0],
+                    m.mat_rgba[matId * 4 + 1],
+                    m.mat_rgba[matId * 4 + 2],
+                ];
+            }
+            return [r, gC, b];
+        }
+        return null;
+    }
+
     /// Build a SceneReport from the current MuJoCo bodies (no iPhone stream
     /// needed). Used when the user wants to Plan/Execute against the
     /// default demo scene (20 random cubes) before pressing Radio. Each
@@ -483,8 +542,6 @@ export class MujocoSim {
     /// stack them" without ever calling a VLM detector.
     synthesizeSceneFromBodies(): SceneReport | null {
         if (!this.mjModel || !this.mjData) return null;
-        // Matches the cube colour order in RobotLoader.patchSingleRobot.
-        const COLORS = ['red', 'cyan', 'green', 'yellow'];
         const objects: { id: string; label: string; center_world: [number, number, number]; size_m: [number, number, number]; yaw_rad: number; confidence: number; }[] = [];
         for (let i = 0; i < this.mjModel.nbody; i++) {
             const name = getName(this.mjModel, this.mjModel.name_bodyadr[i]);
@@ -494,13 +551,20 @@ export class MujocoSim {
             // stage fails with "no scene from Detect stage".
             const m = name.match(/^cube(\d*)$/);
             if (!m) continue;
-            const idx = m[1] === '' ? 0 : parseInt(m[1], 10);
             const px = this.mjData.xpos[i * 3];
             const py = this.mjData.xpos[i * 3 + 1];
             const pz = this.mjData.xpos[i * 3 + 2];
+            // Read the actual rgba of this cube's first geom so Gemini's
+            // symbolic list reflects what the user sees, not an
+            // index-based guess. Earlier bug: cube1 was rendered red but
+            // labelled "cyan cube" via COLORS[idx%4], causing Gemini to
+            // see only one "red cube" in scene and refuse pluralised
+            // commands like "stack the red cubes".
+            const rgba = this.geomRgbaForBody(i);
+            const label = rgba ? `${colorNameFromRgb(rgba)} cube` : 'cube';
             objects.push({
                 id: name,
-                label: `${COLORS[idx % 4]} cube`,
+                label,
                 center_world: [px, py, pz],
                 size_m: [0.04, 0.04, 0.04],
                 yaw_rad: 0,
@@ -542,12 +606,19 @@ export class MujocoSim {
     /// Step-3.5 entry point: hand the SequenceAnimator a flat queue of
     /// primitive action steps and run them in order. Mirrors pickupItems
     /// for the action-plan flow.
-    executePlan(steps: PrimitiveStep[], onFinished?: () => void) {
+    executePlan(
+        steps: PrimitiveStep[],
+        onFinished?: () => void,
+        onFailed?: (failure: ExpectFailure) => void,
+    ) {
         if (!this.mjData) {
             onFinished?.();
             return;
         }
         this.ikSys.syncToSite(this.mjData);
+
+        const verifyExpect = this.buildExpectVerifier();
+
         this.sequenceAnimator.executeActions(
             steps,
             this.ikSys.target,
@@ -562,8 +633,131 @@ export class MujocoSim {
                 this.ikSys.setGizmoVisible(false);
                 onFinished?.();
             },
+            verifyExpect,
+            (failure) => {
+                // Same cleanup as the success path — animator already
+                // halted, but the IK gizmo is parked mid-trajectory.
+                this.ikSys.setTargetVisible(false);
+                this.ikSys.setGizmoVisible(false);
+                onFailed?.(failure);
+            },
         );
         this.setIkEnabled(false);
+    }
+
+    /// Build a snapshot-driven verifier closure for the SequenceAnimator.
+    /// Reads live mjData / ikSys state at each call. Returns null on
+    /// pass, ExpectFailure on fail. Bodies are resolved via the same
+    /// stream-then-name fallback as App.tsx:lookupTrackPos so synthetic
+    /// scenes (cube0/1/2) and stream-injected bodies both work.
+    private buildExpectVerifier(): ExpectVerifier {
+        const lookupBody = (trackId: string): THREE.Vector3 | null => {
+            // Stream lookup: streamBodyName sanitizes non-alphanumeric
+            // chars in trackId to '_' (so a UUID like
+            // "07140820-D5D9-..." becomes "..._07140820_D5D9_..."),
+            // but Gemini emits the ORIGINAL UUID with hyphens. Apply
+            // the same sanitization here before suffix-matching, or
+            // we never find a stream body for hyphenated track IDs.
+            const safeId = trackId.replace(/[^a-zA-Z0-9]/g, '_');
+            for (const [name, bodyId] of this.streamBodyMap) {
+                if (name.endsWith(`_${safeId}`)) {
+                    return this.renderSys.bodies[bodyId]?.position.clone() ?? null;
+                }
+            }
+            return this.getBodyPositionByName(trackId);
+        };
+
+        return (step: PrimitiveStep): ExpectFailure | null => {
+            if (!this.mjData) return null;
+            if (step.kind === 'expect_holding') {
+                const siteId = this.ikSys.gripperSiteId;
+                if (siteId < 0) return null; // gripper site not found — skip silently
+                const tcp: [number, number, number] = [
+                    this.mjData.site_xpos[siteId * 3],
+                    this.mjData.site_xpos[siteId * 3 + 1],
+                    this.mjData.site_xpos[siteId * 3 + 2],
+                ];
+                const body = lookupBody(step.track_id);
+                const gripperCtrl = this.gripperActuatorId >= 0
+                    ? this.mjData.ctrl[this.gripperActuatorId]
+                    : 0;
+                if (!body) {
+                    return {
+                        stepIndex: 0,
+                        kind: 'expect_holding',
+                        track_id: step.track_id,
+                        message: `body "${step.track_id}" not in current sim`,
+                        reasons: ['body_missing'],
+                        observed: { tcp, gripperCtrl },
+                        expected: { tol_m: step.tol_m },
+                    };
+                }
+                const dx = tcp[0] - body.x;
+                const dy = tcp[1] - body.y;
+                const dz = tcp[2] - body.z;
+                const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                // Pass = TCP near body AND gripper commanded ≤ half-open.
+                // The 128 threshold tracks the open=255 / closed=0
+                // convention used by both PiPER and Franka in this sim.
+                const distOk = dist < step.tol_m;
+                const gripperClosed = gripperCtrl < 128;
+                if (distOk && gripperClosed) return null;
+                const messages: string[] = [];
+                const reasons: ExpectFailureReason[] = [];
+                if (!distOk) {
+                    messages.push(`TCP-to-body ${dist.toFixed(3)}m > tol ${step.tol_m.toFixed(3)}m`);
+                    reasons.push('distance');
+                }
+                if (!gripperClosed) {
+                    messages.push(`gripperCtrl=${gripperCtrl.toFixed(0)} ≥ 128 (gripper still open)`);
+                    reasons.push('gripper_open');
+                }
+                return {
+                    stepIndex: 0,
+                    kind: 'expect_holding',
+                    track_id: step.track_id,
+                    message: messages.join(', '),
+                    reasons,
+                    observed: { tcp, body: [body.x, body.y, body.z], gripperCtrl },
+                    expected: { tol_m: step.tol_m },
+                };
+            }
+            if (step.kind === 'expect_at') {
+                const body = lookupBody(step.track_id);
+                if (!body) {
+                    return {
+                        stepIndex: 0,
+                        kind: 'expect_at',
+                        track_id: step.track_id,
+                        message: `body "${step.track_id}" not in current sim`,
+                        reasons: ['body_missing'],
+                        observed: {},
+                        expected: {
+                            tol_m: step.tol_m,
+                            targetPos: [step.target.x, step.target.y, step.target.z],
+                        },
+                    };
+                }
+                const dx = body.x - step.target.x;
+                const dy = body.y - step.target.y;
+                const dz = body.z - step.target.z;
+                const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist < step.tol_m) return null;
+                return {
+                    stepIndex: 0,
+                    kind: 'expect_at',
+                    track_id: step.track_id,
+                    message: `body-to-target ${dist.toFixed(3)}m > tol ${step.tol_m.toFixed(3)}m`,
+                    reasons: ['distance'],
+                    observed: { body: [body.x, body.y, body.z] },
+                    expected: {
+                        tol_m: step.tol_m,
+                        targetPos: [step.target.x, step.target.y, step.target.z],
+                    },
+                };
+            }
+            return null;
+        };
     }
 
     /// Look up the current world position of a stream-injected body by its

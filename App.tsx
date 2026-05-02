@@ -14,6 +14,7 @@ import { SceneObject, SceneReport, streamBodyName } from './SceneReport';
 import { SceneReportClient } from './SceneReportClient';
 import { RobotFunctionCall, expandPlan, predictPlanFinalPositions } from './actionLibrary';
 import { planActions } from './geminiPlan';
+import type { ExpectFailure } from './SequenceAnimator';
 import { mujocoToArkit, worldToGemini1000 } from './projection';
 import { RobotSelector } from './components/RobotSelector';
 import { Toolbar } from './components/Toolbar';
@@ -150,7 +151,19 @@ export function App() {
   });
   const [pipelineError, setPipelineError] = useState<string | null>(null);
   const [pipelinePlan, setPipelinePlan] = useState<RobotFunctionCall[]>([]);
+  // Set when the planner emits a single ask_user call. The sidebar
+  // surfaces the question + suggestion buttons; clicking a suggestion
+  // replaces `prompt` and re-runs Plan with the rewritten task. Cleared
+  // by any successful Plan run, by manual reset, or by Detect re-run.
+  const [pipelineClarification, setPipelineClarification] = useState<{
+    question: string;
+    suggested: string[];
+  } | null>(null);
   const pipelineRunning = useRef(false);
+  // 4B replan loop: 0 means Execute is running its initial attempt or
+  // not running at all; 1, 2, ... is the current replan attempt index.
+  // Cap = 3. UI surfaces a "Replanning… (n/3)" badge when > 0.
+  const [pipelineReplanAttempt, setPipelineReplanAttempt] = useState(0);
   // The SceneReport that was used by the most recent Detect — Stage 2
   // looks up track positions in its `objects[]` to expand the plan.
   const lastDetectScene = useRef<SceneReport | null>(null);
@@ -339,6 +352,8 @@ export function App() {
     setPipelineStatus({ detect: 'pending', plan: 'pending', execute: 'pending' });
     setPipelineError(null);
     setPipelinePlan([]);
+    setPipelineClarification(null);
+    setPipelineReplanAttempt(0);
     pipelineRunning.current = false;
     simRef.current?.renderSys.clearPlanPreview();
   };
@@ -415,33 +430,88 @@ export function App() {
   ) => {
     if (pipelineRunning.current) return;
     pipelineRunning.current = true;
-    // Fresh-state reset on every press: pressing any stage button always
-    // triggers a complete cascade rerun. Without this, after a successful
-    // full run the chips read 'done' and the if-checks below skip every
-    // stage, so subsequent presses appear to do nothing — what the user
-    // saw as "stuck on Detecting...".
-    setPipelineStatus({ detect: 'pending', plan: 'pending', execute: 'pending' });
     setPipelineError(null);
-    setPipelinePlan([]);
-    simRef.current?.renderSys.clearPlanPreview();
+    setPipelineClarification(null);
+    setPipelineReplanAttempt(0);
+
+    // Cache-aware cascade. Each stage button auto-runs prerequisites
+    // ONLY if they're missing/failed; a 'done' upstream stage is reused.
+    // Pressing Detect always re-detects (the user is asking for a fresh
+    // perception read). Pressing Plan keeps the existing detection if
+    // present and re-plans. Pressing Execute keeps both Detect and Plan
+    // and just re-runs the arm motion. Downstream stages are always
+    // reset to pending so old "done" chips don't lie about state that
+    // hasn't been recomputed against the new upstream output.
+    const status = pipelineStatus;
+    // Stale-cache check: under iPhone MOT track-ID churn the stream may
+    // have replaced track UUIDs since the last Detect. If any cached
+    // scene object can no longer be resolved to a position in the
+    // current sim, the detect cache is stale and reusing it would make
+    // Gemini emit UUIDs the executor can't find. Force a re-detect in
+    // that case rather than failing later with "track_id not in sim".
+    let detectCacheValid = lastDetectScene.current !== null;
+    if (detectCacheValid && lastDetectScene.current) {
+      for (const obj of lastDetectScene.current.objects) {
+        if (!lookupTrackPos(obj.id)) { detectCacheValid = false; break; }
+      }
+    }
+    const haveDetect = status.detect === 'done' && detectCacheValid;
+    const havePlan = status.plan === 'done' && pipelinePlan.length > 0 && haveDetect;
+    const reuseDetect = stopAt !== 'detect' && haveDetect;
+    const reusePlan = stopAt === 'execute' && havePlan;
+
+    setPipelineStatus({
+      detect:  reuseDetect ? 'done' : 'pending',
+      plan:    reusePlan   ? 'done' : 'pending',
+      execute: 'pending',
+    });
+    if (!reusePlan) {
+      setPipelinePlan([]);
+      simRef.current?.renderSys.clearPlanPreview();
+    }
 
     try {
       // ── Stage 1 — Detect ──
-      setPipelineStatus((s) => ({ ...s, detect: 'running' }));
-      await runDetectStage(prompt, type, temperature, enableThinking, modelId);
-      setPipelineStatus((s) => ({ ...s, detect: 'done' }));
+      if (!reuseDetect) {
+        setPipelineStatus((s) => ({ ...s, detect: 'running' }));
+        await runDetectStage(prompt, type, temperature, enableThinking, modelId);
+        setPipelineStatus((s) => ({ ...s, detect: 'done' }));
+      }
       if (stopAt === 'detect') return;
 
       // ── Stage 2 — Plan ──
-      setPipelineStatus((s) => ({ ...s, plan: 'running' }));
-      const calls = await runPlanStage(prompt, temperature, enableThinking, modelId);
-      setPipelinePlan(calls);
-      setPipelineStatus((s) => ({ ...s, plan: 'done' }));
+      let calls = pipelinePlan;
+      if (!reusePlan) {
+        setPipelineStatus((s) => ({ ...s, plan: 'running' }));
+        calls = await runPlanStage(prompt, temperature, enableThinking, modelId);
+        // Detect the ask_user clarification meta-call. A clarification
+        // is a single-item array with one ask_user; the host surfaces
+        // a banner and stops the cascade WITHOUT marking Plan failed.
+        // (The planner may still legitimately return [] for impossible
+        // tasks — that path falls through to runPlanStage's throw.)
+        const isClarification =
+          calls.length === 1 && calls[0]?.function === 'ask_user';
+        if (isClarification) {
+          const ask = calls[0] as { function: 'ask_user'; args: { question: string; suggested?: string[] } };
+          setPipelineClarification({
+            question: ask.args.question,
+            suggested: ask.args.suggested ?? [],
+          });
+          setPipelinePlan([]);
+          // Reset Plan to pending — the user must adopt a clarification
+          // (or rewrite the prompt manually) and press Plan again.
+          setPipelineStatus((s) => ({ ...s, plan: 'pending', execute: 'pending' }));
+          return;
+        }
+        setPipelineClarification(null);
+        setPipelinePlan(calls);
+        setPipelineStatus((s) => ({ ...s, plan: 'done' }));
+      }
       if (stopAt === 'plan') return;
 
       // ── Stage 3 — Execute ──
       setPipelineStatus((s) => ({ ...s, execute: 'running' }));
-      await runExecuteStage(calls);
+      await runExecuteStage(calls, { temperature, enableThinking, modelId, task: prompt });
       setPipelineStatus((s) => ({ ...s, execute: 'done' }));
     } catch (err) {
       const msg = (err as Error).message ?? String(err);
@@ -562,7 +632,36 @@ export function App() {
     return result.calls;
   };
 
-  const runExecuteStage = async (calls: RobotFunctionCall[]): Promise<void> => {
+  /// 4B max replan attempts. After this many distinct-signature
+  /// failures the loop gives up and surfaces the last failure to the
+  /// user via pipelineError. 3 mirrors DoReMi/REFLECT defaults.
+  const MAX_REPLAN_ATTEMPTS = 3;
+
+  /// 4B failure signature for "no progress" abort. Two consecutive
+  /// failures with the same kind + track_id + reasons means the
+  /// planner is repeating itself — bail rather than burn LLM calls.
+  const failureSignature = (f: ExpectFailure): string =>
+    `${f.kind}|${f.track_id}|${[...f.reasons].sort().join(',')}`;
+
+  /// Refresh per-object positions from current sim state without
+  /// re-running Detect. Track UUIDs and labels are kept stable by the
+  /// 3.14 graveyard; only world centres can drift between attempts
+  /// (arm bumped the cube, stream tick updated). Pass through any
+  /// scene-level fields (image, etc.) untouched. (Step 4B)
+  const sceneWithFreshPositions = (scene: SceneReport): SceneReport => {
+    return {
+      ...scene,
+      objects: scene.objects.map((o) => {
+        const live = lookupTrackPos(o.id);
+        if (!live) return o;
+        return { ...o, center_world: [live.x, live.y, live.z] };
+      }),
+    };
+  };
+
+  /// Inner one-attempt execute. Throws an Error tagged with .failure
+  /// when expect_* rejects so the outer loop can branch by structure.
+  const runOneExecuteAttempt = async (calls: RobotFunctionCall[]): Promise<void> => {
     const scene = lastDetectScene.current;
     if (!scene) throw new Error('Execute: no scene available');
     if (!simRef.current) throw new Error('Execute: sim not ready');
@@ -585,14 +684,117 @@ export function App() {
       quat: home.quat,
       duration_s: 1.5,
     });
-    setIsPickingUp(true);
-    await new Promise<void>((resolve) => {
-      simRef.current!.executePlan(expansion.steps, () => resolve());
+    await new Promise<void>((resolve, reject) => {
+      simRef.current!.executePlan(
+        expansion.steps,
+        () => resolve(),
+        (failure) => {
+          // Tag the Error so the outer 4B replan loop can read the
+          // structured failure (kind, track_id, reasons[], observed,
+          // expected) without parsing the human-readable message.
+          const err = new Error(`${failure.kind}(${failure.track_id}) failed: ${failure.message}`) as Error & { failure?: ExpectFailure };
+          err.failure = failure;
+          reject(err);
+        },
+      );
     });
-    setIsPickingUp(false);
-    // Clear the Tesla ghost overlay — real cubes now occupy where the
-    // ghosts were, no need to keep the comparison overlay around.
-    simRef.current.renderSys.clearPlanPreview();
+  };
+
+  /// 4B execute stage — wraps a replan loop around runOneExecuteAttempt.
+  /// On expect_* failure: feed the failure back to Gemini, ask for a
+  /// corrective plan, retry. Cap MAX_REPLAN_ATTEMPTS; abort early if
+  /// two consecutive failures share the same signature (no-progress).
+  const runExecuteStage = async (
+    calls: RobotFunctionCall[],
+    plannerOpts: { temperature: number; enableThinking: boolean; modelId: string; task: string },
+  ): Promise<void> => {
+    setIsPickingUp(true);
+    setPipelineReplanAttempt(0);
+    let currentCalls = calls;
+    let priorSig: string | null = null;
+    let lastFailure: ExpectFailure | null = null;
+
+    try {
+      for (let attempt = 0; attempt <= MAX_REPLAN_ATTEMPTS; attempt++) {
+        try {
+          await runOneExecuteAttempt(currentCalls);
+          // Success — clear the ghost overlay and bail out of the loop.
+          simRef.current?.renderSys.clearPlanPreview();
+          return;
+        } catch (err) {
+          const failure = (err as Error & { failure?: ExpectFailure }).failure;
+          if (!failure) throw err; // non-assertion error — let runPipeline catch it
+          lastFailure = failure;
+          const sig = failureSignature(failure);
+          if (priorSig !== null && sig === priorSig) {
+            throw new Error(
+              `Replan abort (no progress): same failure signature "${sig}" twice in a row. Last: ${failure.message}`,
+            );
+          }
+          if (attempt >= MAX_REPLAN_ATTEMPTS) {
+            throw new Error(
+              `Replan gave up after ${MAX_REPLAN_ATTEMPTS} attempts. Last: ${failure.kind}(${failure.track_id}) — ${failure.message}`,
+            );
+          }
+          // Replan: refresh scene positions + feed failure context to Gemini.
+          priorSig = sig;
+          setPipelineReplanAttempt(attempt + 1);
+          const refreshedScene = sceneWithFreshPositions(lastDetectScene.current!);
+          const apiKey = process.env.API_KEY ?? '';
+          const result = await planActions(
+            apiKey,
+            plannerOpts.modelId,
+            plannerOpts.task,
+            refreshedScene.objects,
+            {
+              temperature: plannerOpts.temperature,
+              thinking: plannerOpts.enableThinking,
+              image: refreshedScene.image
+                ? { mime: refreshedScene.image.mime, base64: refreshedScene.image.base64 }
+                : undefined,
+              priorPlan: currentCalls,
+              priorFailure: failure,
+            },
+          );
+          // ask_user as recovery: surface clarification banner, abort loop
+          // (the user picks a suggested rewrite and re-runs Plan manually).
+          if (result.calls.length === 1 && result.calls[0]?.function === 'ask_user') {
+            const ask = result.calls[0] as { function: 'ask_user'; args: { question: string; suggested?: string[] } };
+            setPipelineClarification({ question: ask.args.question, suggested: ask.args.suggested ?? [] });
+            throw new Error(`Replan asked for clarification: "${ask.args.question}"`);
+          }
+          if (result.calls.length === 0) {
+            throw new Error(
+              `Replan returned no actionable calls. ${result.warnings.join('; ') || result.rawText.slice(0, 200)}`,
+            );
+          }
+          currentCalls = result.calls;
+          setPipelinePlan(currentCalls);
+          // Re-render the ghost overlay for the new plan so the user
+          // sees what's about to be attempted next.
+          if (simRef.current && refreshedScene.objects.length > 0) {
+            const predictions = predictPlanFinalPositions(currentCalls, lookupTrackPos);
+            const items: { trackId: string; currentPos: THREE.Vector3; finalPos: THREE.Vector3; size: [number, number, number]; label?: string }[] = [];
+            for (const [trackId, finalPos] of predictions) {
+              const obj = refreshedScene.objects.find((o) => o.id === trackId);
+              if (!obj) continue;
+              const currentPos = lookupTrackPos(trackId);
+              if (!currentPos) continue;
+              items.push({ trackId, currentPos, finalPos, size: obj.size_m, label: obj.label });
+            }
+            simRef.current.renderSys.setPlanPreview(items);
+          }
+        }
+      }
+      // Should be unreachable — loop body either returns on success or
+      // throws on failure. Keep an explicit throw so TS is happy.
+      throw new Error(
+        `Replan loop exited unexpectedly. Last: ${lastFailure?.message ?? 'unknown'}`,
+      );
+    } finally {
+      setIsPickingUp(false);
+      setPipelineReplanAttempt(0);
+    }
   };
 
   // Stage 1 of the pipeline. Always runs the full cinematic VLM flow
@@ -989,6 +1191,9 @@ export function App() {
             pipelineStatus={pipelineStatus}
             pipelineError={pipelineError}
             pipelinePlan={pipelinePlan}
+            pipelineClarification={pipelineClarification}
+            pipelineReplanAttempt={pipelineReplanAttempt}
+            onApplyClarification={() => setPipelineClarification(null)}
             onPipelineReset={resetPipeline}
             prompt={prompt}
             onPromptChange={setPrompt}

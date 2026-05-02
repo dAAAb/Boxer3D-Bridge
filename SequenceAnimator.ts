@@ -9,6 +9,29 @@ import { IkSystem } from './IkSystem';
 import type { PrimitiveStep } from './actionLibrary';
 import { MujocoData, MujocoModel } from './types';
 
+/// Structured diagnostic returned by the verifyExpect closure when an
+/// expect_* assertion fails. Surfaced through executeActions's onFailed
+/// callback so callers (App.tsx) can render an actionable banner and
+/// (in 4B) feed the failure back to Gemini for replanning.
+/// Discrete reason codes for an assertion failure. Used by the 4B
+/// replan loop to compute a "failure signature" and abort when two
+/// consecutive failures share the same reason set (REFLECT-style
+/// no-progress detection). The human-readable `message` field still
+/// contains the full text — these codes are the structured complement.
+export type ExpectFailureReason = 'distance' | 'gripper_open' | 'body_missing';
+
+export interface ExpectFailure {
+  stepIndex: number;
+  kind: 'expect_holding' | 'expect_at';
+  track_id: string;
+  message: string;
+  reasons: ExpectFailureReason[];
+  observed: { tcp?: [number, number, number]; body?: [number, number, number]; gripperCtrl?: number };
+  expected: { tol_m: number; targetPos?: [number, number, number] };
+}
+
+export type ExpectVerifier = (step: PrimitiveStep) => ExpectFailure | null;
+
 /**
  * SequenceAnimator
  * A simple state machine that automates the robot.
@@ -63,6 +86,14 @@ export class SequenceAnimator {
     /// Fallback gripper value for steps that don't change the gripper —
     /// keeps the previous open/close state instead of resetting to 0.
     private currentGripperVal = 0;
+    /// Synchronous assertion evaluator. MujocoSim builds this with
+    /// access to mjData / TCP site / gripper actuator and passes it
+    /// into executeActions. Null = not in action mode or no expects.
+    private verifyExpect?: ExpectVerifier;
+    /// Callback invoked when an expect_* step fails. Stops the queue
+    /// and lets App.tsx reject its execute promise with a useful
+    /// message. Cleared on reset / completion.
+    private onFailed?: (failure: ExpectFailure) => void;
 
     constructor() {
         this.names = ["Move over Cube", "Hover", "Open", "Lower", "Wait", "Grasp", "Wait", "Lift", "Move to Tray", "Lower", "Wait", "Release", "Wait", "Lift", "Return Home"];
@@ -128,6 +159,8 @@ export class SequenceAnimator {
         this.useActionMode = false;
         this.actionQueue = [];
         this.actionIdx = 0;
+        this.verifyExpect = undefined;
+        this.onFailed = undefined;
     }
 
     /// Step-3.5 entry point: hand the animator a flat queue of primitive
@@ -141,12 +174,16 @@ export class SequenceAnimator {
         mjData: MujocoData,
         ikSystem: IkSystem,
         onFinished?: () => void,
+        verifyExpect?: ExpectVerifier,
+        onFailed?: (failure: ExpectFailure) => void,
     ) {
         if (steps.length === 0) {
             onFinished?.();
             return;
         }
         this.onFinished = onFinished;
+        this.onFailed = onFailed;
+        this.verifyExpect = verifyExpect;
         this.onPickupComplete = undefined;
         this.useActionMode = true;
         this.actionQueue = steps;
@@ -168,6 +205,8 @@ export class SequenceAnimator {
             this.useActionMode = false;
             this.actionQueue = [];
             this.actionIdx = 0;
+            this.verifyExpect = undefined;
+            this.onFailed = undefined;
             this.onFinished?.();
             this.onFinished = undefined;
             return;
@@ -203,6 +242,30 @@ export class SequenceAnimator {
             case 'wait':
                 this.duration = step.duration_s;
                 break;
+            case 'expect_holding':
+            case 'expect_at': {
+                // Synchronous assertion. The verifier reads mjData and
+                // returns null on pass, ExpectFailure on fail. On fail
+                // we stop the queue and surface the diagnostic; on pass
+                // we collapse this into a near-zero-duration step so
+                // update() advances on the next tick without animating.
+                const failure = this.verifyExpect?.(step) ?? null;
+                if (failure) {
+                    failure.stepIndex = this.actionIdx;
+                    this.running = false;
+                    this.useActionMode = false;
+                    const cb = this.onFailed;
+                    this.actionQueue = [];
+                    this.actionIdx = 0;
+                    this.onFailed = undefined;
+                    this.onFinished = undefined;
+                    this.verifyExpect = undefined;
+                    cb?.(failure);
+                    return;
+                }
+                this.duration = 0.001;
+                break;
+            }
         }
         this.gripperVal = this.currentGripperVal;
 
@@ -228,6 +291,8 @@ export class SequenceAnimator {
         this.actionQueue = [];
         this.actionIdx = 0;
         this.currentGripperVal = 0;
+        this.verifyExpect = undefined;
+        this.onFailed = undefined;
     }
 
     // Called every frame to smoothly move the joints towards destination

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import { AlertCircle, BoxSelect, Check, ChevronDown, FastForward, Grab, History, Info, Loader2, MousePointer2, Play, RotateCcw, Scan, Send, Settings2, Sparkles, Thermometer, X } from 'lucide-react';
+import { AlertCircle, BoxSelect, Check, ChevronDown, FastForward, Grab, HelpCircle, History, Info, Loader2, MousePointer2, Play, RotateCcw, Scan, Send, Settings2, Sparkles, Thermometer, X } from 'lucide-react';
 import { useState } from 'react';
 import { LogOverlay } from '../App';
 import { RobotFunctionCall } from '../actionLibrary';
@@ -87,6 +87,12 @@ interface UnifiedSidebarProps {
   pipelineStatus?: PipelineState;
   pipelineError?: string | null;
   pipelinePlan?: RobotFunctionCall[];
+  pipelineClarification?: { question: string; suggested: string[] } | null;
+  /// 4B: 0 when no replan is in flight; 1, 2, 3 = current attempt.
+  /// Surfaces an amber "Replanning… (n/3)" badge so the user knows
+  /// why Execute is taking longer than usual on a flaky grasp.
+  pipelineReplanAttempt?: number;
+  onApplyClarification?: (suggestion: string) => void;
   onPipelineReset?: () => void;
   prompt?: string;
   onPromptChange?: (next: string) => void;
@@ -116,6 +122,9 @@ export function UnifiedSidebar({
   pipelineStatus = { detect: 'pending', plan: 'pending', execute: 'pending' },
   pipelineError = null,
   pipelinePlan = [],
+  pipelineClarification = null,
+  pipelineReplanAttempt = 0,
+  onApplyClarification,
   onPipelineReset,
   prompt = '',
   onPromptChange,
@@ -317,6 +326,20 @@ export function UnifiedSidebar({
           {/* Pipeline status chips — one per stage, ✓ done / ⟳ running / • pending. */}
           <PipelineChipRow status={pipelineStatus} isDarkMode={isDarkMode} onReset={onPipelineReset} />
 
+          {/* 4B replan badge. Visible only while a replan attempt is in
+              flight (set to 1..3 by App.tsx). The chip row stays
+              "execute: running" the whole time; this badge tells the
+              user WHY it's running longer than usual and how many
+              tries are left. */}
+          {pipelineReplanAttempt > 0 && (
+            <div className={`flex items-center gap-2 px-3 py-2 rounded-2xl border text-[11px] ${
+              isDarkMode ? 'bg-amber-500/10 border-amber-500/30 text-amber-200' : 'bg-amber-50 border-amber-200 text-amber-800'
+            }`}>
+              <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin" />
+              <span>Replanning… ({pipelineReplanAttempt}/3)</span>
+            </div>
+          )}
+
           {/* Plan preview — shown after Plan stage completes. Lets user
               eyeball the action sequence before pressing Execute (the B
               "human-in-loop" flow), and also visible after a cascaded
@@ -349,6 +372,49 @@ export function UnifiedSidebar({
             }`}>
               <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
               <span className="flex-1 break-words">{pipelineError}</span>
+            </div>
+          )}
+
+          {/* Clarification banner (Step 3.13). Shown when the planner emits
+              an ask_user meta-call instead of a robot action — task was
+              ambiguous given the detected scene. The user picks a suggested
+              rewrite (one click → swaps prompt + re-runs Plan) or types
+              their own correction in the input above. */}
+          {pipelineClarification && (
+            <div className={`p-3 rounded-2xl border text-[11px] leading-relaxed space-y-2 ${
+              isDarkMode ? 'bg-amber-500/10 border-amber-500/30 text-amber-200' : 'bg-amber-50 border-amber-200 text-amber-800'
+            }`}>
+              <div className="flex items-start gap-2">
+                <HelpCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                <span className="flex-1 break-words">{pipelineClarification.question}</span>
+              </div>
+              {pipelineClarification.suggested.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 pl-5">
+                  {pipelineClarification.suggested.map((s, i) => (
+                    <button
+                      key={i}
+                      onClick={() => {
+                        // One-click adopt: dismiss the banner, swap the
+                        // prompt input field, and re-run Plan with the
+                        // rewritten task (cached Detect is reused). All
+                        // three are needed because React state updates
+                        // are async; passing `s` directly to onPlan
+                        // sidesteps the stale-prompt closure.
+                        onApplyClarification?.(s);
+                        onPromptChange?.(s);
+                        onPlan(s, type, temperature, enableThinking, modelId);
+                      }}
+                      className={`px-2.5 py-1 rounded-full text-[10px] font-medium border transition-colors ${
+                        isDarkMode
+                          ? 'bg-amber-500/15 border-amber-500/40 text-amber-100 hover:bg-amber-500/25'
+                          : 'bg-white border-amber-300 text-amber-900 hover:bg-amber-100'
+                      }`}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 

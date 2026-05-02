@@ -168,8 +168,12 @@ export class VisualMeshLoader {
         // material name). Falls back to a shared steel-grey when the
         // geom has no `material=` attribute or the name isn't declared.
         const materialCache = new Map<string, THREE.MeshStandardMaterial>();
+        // Match GeomBuilder.ts (roughness 0.6, metalness 0.2) so OBJ
+        // link2-5 shade identically to the STL base/wrist that mujoco-js
+        // renders directly. Earlier mismatch (0.45/0.3) made the body
+        // look noticeably darker than the gripper under the same light.
         const fallbackMat = new THREE.MeshStandardMaterial({
-            color: 0xa0a8b0, roughness: 0.5, metalness: 0.35,
+            color: NEUTRAL_GRAY, roughness: 0.6, metalness: 0.2,
         });
         const getMat = (name: string | null): THREE.MeshStandardMaterial => {
             if (!name) return fallbackMat;
@@ -179,10 +183,8 @@ export class VisualMeshLoader {
             if (hex === undefined) return fallbackMat;
             const m = new THREE.MeshStandardMaterial({
                 color: hex,
-                // Reds/whites/blacks all look fine with a mild metallic
-                // (the original PiPER renders have a satin finish).
-                roughness: 0.45,
-                metalness: 0.3,
+                roughness: 0.6,
+                metalness: 0.2,
             });
             materialCache.set(name, m);
             return m;

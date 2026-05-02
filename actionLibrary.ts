@@ -20,7 +20,22 @@ export type RobotFunctionCall =
   | { function: 'open_gripper';   args?: Record<string, never> }
   | { function: 'close_gripper';  args?: Record<string, never> }
   | { function: 'move_to_pose';   args: { x: number; y: number; z: number; yaw_rad?: number } }
-  | { function: 'wait';           args: { seconds: number } };
+  | { function: 'wait';           args: { seconds: number } }
+  // Runtime-checked assertions (Step 4A-1). The planner emits these as
+  // checkpoints between robot actions. expect_holding declares "I expect
+  // to be holding track_id right now"; expect_at declares "I expect
+  // track_id to be near (x, y, z) right now". The runtime evaluates
+  // them synchronously against MuJoCo state and stops the queue with a
+  // structured failure if the assertion is false. Tolerances default
+  // to sensible cube-grasp values (see expandPlan).
+  | { function: 'expect_holding'; args: { track_id: string; tol_m?: number } }
+  | { function: 'expect_at';      args: { track_id: string; x: number; y: number; z: number; tol_m?: number } }
+  // Meta-call — NOT a robot action. Emitted by the planner when the task
+  // is ambiguous / under-specified given the detected scene, instead of
+  // returning an empty array. Caller (App.tsx) intercepts before
+  // expandPlan and surfaces a clarification UI; the user picks a
+  // suggestion or rewrites the prompt and re-runs Plan.
+  | { function: 'ask_user';       args: { question: string; suggested?: string[] } };
 
 // ─── What SequenceAnimator consumes ─────────────────────────────────────
 //
@@ -32,7 +47,13 @@ export type PrimitiveStep =
   | { kind: 'move_to_pose'; pos: THREE.Vector3; quat?: THREE.Quaternion; duration_s: number }
   | { kind: 'open_gripper';  duration_s?: number }
   | { kind: 'close_gripper'; duration_s?: number }
-  | { kind: 'wait';          duration_s: number };
+  | { kind: 'wait';          duration_s: number }
+  // Zero-duration synchronous assertions. Animator dispatches these to
+  // a verifier closure (built in MujocoSim) that reads mjData and
+  // returns null on pass / ExpectFailure on fail; on fail the queue is
+  // halted and onFailed is invoked with the structured diagnostic.
+  | { kind: 'expect_holding'; track_id: string; tol_m: number }
+  | { kind: 'expect_at';      track_id: string; target: THREE.Vector3; tol_m: number };
 
 // ─── Function-library docs for the Gemini Stage-2 prompt ────────────────
 
@@ -57,6 +78,19 @@ Available functions (each entry: {"function": "name", "args": {...}}):
 - move_to_pose({x, y, z, yaw_rad?}): Move TCP to coords; yaw_rad is rotation
   around +Z, defaults to gripper-pointing-down.
 - wait({seconds}): Pause.
+- ask_user({question, suggested?}): Meta-call. Emit ONLY when the task is
+  ambiguous given the scene (e.g. plural referent matches one object,
+  unspecified target). Output a single-item array containing this call;
+  do not mix with robot actions. The "suggested" field is an optional list
+  of 1-3 short prompt rewrites the user can one-click to accept.
+- expect_holding({track_id, tol_m?}): Runtime assertion. Use immediately
+  after pick(track_id) to verify the grasp succeeded. The runtime checks
+  TCP-to-body distance and gripper closure; if the body slipped or was
+  missed, execution halts with a useful error. Default tol_m=0.08.
+- expect_at({track_id, x, y, z, tol_m?}): Runtime assertion. Use after
+  place_above / place_at to verify the body landed near the intended
+  spot. Default tol_m=0.05. Assertions are cheap and let the host catch
+  failures early instead of marching through a doomed plan.
 
 Output format: JSON array, no prose. Example for "stack the two cups":
 [
@@ -217,6 +251,40 @@ export function expandPlan(
       case 'wait':
         steps.push({ kind: 'wait', duration_s: call.args.seconds });
         break;
+      case 'expect_holding': {
+        const id = call.args.track_id;
+        if (!scene.objects.find((o) => o.id === id)) {
+          warnings.push(`expect_holding: track_id "${id}" not in scene; dropping assertion.`);
+          break;
+        }
+        steps.push({
+          kind: 'expect_holding',
+          track_id: id,
+          tol_m: call.args.tol_m ?? 0.08,
+        });
+        break;
+      }
+      case 'expect_at': {
+        const id = call.args.track_id;
+        if (!scene.objects.find((o) => o.id === id)) {
+          warnings.push(`expect_at: track_id "${id}" not in scene; dropping assertion.`);
+          break;
+        }
+        steps.push({
+          kind: 'expect_at',
+          track_id: id,
+          target: new THREE.Vector3(call.args.x, call.args.y, call.args.z),
+          tol_m: call.args.tol_m ?? 0.05,
+        });
+        break;
+      }
+      case 'ask_user':
+        // Meta-call. Caller MUST intercept before expandPlan so the user
+        // sees a clarification banner instead of a silent skip. If we
+        // got here something is wrong upstream — log a warning and drop
+        // the step rather than crashing the animator.
+        warnings.push(`ask_user reached expandPlan; should be handled by caller. q="${call.args.question}"`);
+        break;
       default: {
         // Type system ensures exhaustive — runtime guard for malformed
         // Gemini output that slipped past JSON parsing.
@@ -289,7 +357,13 @@ export function predictPlanFinalPositions(
       case 'open_gripper':
         held = null;
         break;
-      // close_gripper, move_to_pose, wait — no cube state change.
+      case 'expect_holding':
+      case 'expect_at':
+        // Assertions are read-only — no cube state change. Listed
+        // explicitly so a future variant addition is forced through
+        // exhaustiveness rather than silently falling into default.
+        break;
+      // close_gripper, move_to_pose, wait, ask_user — no cube state change.
       default:
         break;
     }
